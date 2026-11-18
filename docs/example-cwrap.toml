@@ -1,0 +1,20 @@
+# 全局默认配置示例。复制到 ~/.config/cwrap/cwrap.toml
+# 优先级：全局 < 应用(~/.config/cwrap/apps/<app>.toml) < 命令行 FLAG
+
+app = "demo"
+# home = "/srv/sandbox/demo"
+
+# 权限（全部默认为空 = 零权限）
+share = ["network"]          # network, ipc
+socket = ["x11", "wayland"]  # x11, wayland, pulseaudio, pipewire, cups, pcsc, ssh-agent
+device = []                  # dri, kvm, all
+allow = []                   # devel, multiarch
+fs = []                      # "rw:/path", "ro:/path"
+dbus = [
+  # "session.talk=org.freedesktop.Notifications",
+  # "session.own=org.example.Demo",
+  # "system.talk=org.freedesktop.UPower",
+]
+seccomp = "medium"           # low | medium | high
+allow_syscalls = []
+env = []

@@ -2,11 +2,12 @@
 package cli
 
 import (
-	"fmt"
-	"os"
-	"strings"
+        "fmt"
+        "os"
+        "strings"
 
-	"cwrap/internal/daemon"
+        "cwrap/internal/daemon"
+        "cwrap/internal/version"
 )
 
 // strSlice 支持重复 FLAG 与逗号分隔两种写法。
@@ -14,53 +15,53 @@ type strSlice []string
 
 func (s *strSlice) String() string { return strings.Join(*s, ",") }
 func (s *strSlice) Set(v string) error {
-	for _, item := range strings.Split(v, ",") {
-		item = strings.TrimSpace(item)
-		if item != "" {
-			*s = append(*s, item)
-		}
-	}
-	return nil
+        for _, item := range strings.Split(v, ",") {
+                item = strings.TrimSpace(item)
+                if item != "" {
+                        *s = append(*s, item)
+                }
+        }
+        return nil
 }
 
 // Main 是 CLI 主入口，返回进程退出码。
 func Main(args []string) int {
-	if len(args) == 0 {
-		usage()
-		return 2
-	}
-	switch args[0] {
-	case "run":
-		return cmdRun(args[1:])
-	case "permission":
-		return cmdPermission(args[1:])
-	case "ps":
-		return cmdPS()
-	case "kill":
-		return cmdKill(args[1:])
-	case "clean":
-		return cmdClean()
-	case "daemon":
-		if err := daemon.Run(); err != nil {
-			fmt.Fprintln(os.Stderr, "cwrapd:", err)
-			return 1
-		}
-		return 0
-	case "version", "--version", "-v":
-		fmt.Println("cwrap 1.0.0")
-		return 0
-	case "help", "--help", "-h":
-		usage()
-		return 0
-	default:
-		fmt.Fprintf(os.Stderr, "未知命令 %q\n\n", args[0])
-		usage()
-		return 2
-	}
+        if len(args) == 0 {
+                usage()
+                return 2
+        }
+        switch args[0] {
+        case "run":
+                return cmdRun(args[1:])
+        case "permission":
+                return cmdPermission(args[1:])
+        case "ps":
+                return cmdPS()
+        case "kill":
+                return cmdKill(args[1:])
+        case "clean":
+                return cmdClean()
+        case "daemon":
+                if err := daemon.Run(); err != nil {
+                        fmt.Fprintln(os.Stderr, "cwrapd:", err)
+                        return 1
+                }
+                return 0
+        case "version", "--version", "-v":
+                fmt.Println("cwrap " + version.Value)
+                return 0
+        case "help", "--help", "-h":
+                usage()
+                return 0
+        default:
+                fmt.Fprintf(os.Stderr, "未知命令 %q\n\n", args[0])
+                usage()
+                return 2
+        }
 }
 
 func usage() {
-	fmt.Print(`cwrap - 通俗易懂的 Flatpak 式权限沙箱（bubblewrap 上层包装）
+        fmt.Print(`cwrap - 通俗易懂的 Flatpak 式权限沙箱（bubblewrap 上层包装）
 
 用法:
   cwrap run [FLAGS] -- 命令 [参数...]        在沙箱中运行程序（默认零权限）
@@ -79,11 +80,17 @@ run 权限 FLAG（默认全部拒绝，需要什么给什么）:
   --socket LIST                 x11, wayland, pulseaudio, pipewire, cups, pcsc, ssh-agent
   --device LIST                 dri, kvm, all
   --allow LIST                  devel, multiarch
-  --fs SPEC                     挂载宿主目录: rw:/path 或 ro:/path（可多次）
+  --fs SPEC                     挂载宿主目录: rw:PATH / ro:PATH（可多次）
+                                PATH 支持绝对路径与 flatpak 关键字:
+                                home, host, host-os, host-etc, xdg-*, ~/path，
+                                尾缀 ? 表示目标不存在不报错
   --dbus SPEC                   session.talk=NAME / session.own=NAME /
                                 system.talk=NAME / system.own=NAME（可多次）
+  --tmp MODE                    /tmp 处理: sandbox（默认，私有目录，退出清理）/
+                                sandbox:BASE / tmpfs（全空）/ host（宿主 /tmp）/
+                                /绝对路径（bind 用户目录为 /tmp）
   --seccomp LEVEL               low（宽松黑名单）/ medium（flatpak 级，默认）/
-                                high（默认拒绝+白名单，最严格）
+                                high（默认拒绝+白名单，含 W^X 保护，最严格）
   --allow-syscall LIST          追加白名单 syscall（与等级叠加）
   --env KEY=VALUE               注入环境变量（可多次）
   --persist                     将本次合并后的授权保存为应用配置

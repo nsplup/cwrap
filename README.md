@@ -33,8 +33,16 @@ cwrap run --app demo \
   --dbus session.own=org.example.Demo \
   -- /usr/bin/myapp
 
-# 高严格 seccomp（默认拒绝+白名单）并追加白名单
+# 高严格 seccomp（默认拒绝+白名单，含 W^X 保护）并追加白名单
 cwrap run --app build --seccomp high --allow-syscall memfd_create,clone3 -- ./build.sh
+
+# /tmp 三档：私有目录（默认，退出由 daemon 清理）/ 全空 tmpfs / 宿主 /tmp
+cwrap run --app demo --tmp tmpfs -- /usr/bin/myapp
+cwrap run --app demo --tmp host -- /usr/bin/myapp
+cwrap run --app demo --tmp /mnt/share/tmp -- /usr/bin/myapp
+
+# fs 授权支持 flatpak 关键字展开（home/host/xdg-* 等，? 表示不存在不报错）
+cwrap run --app demo --fs ro:xdg-download? --fs rw:~/project -- /usr/bin/myapp
 
 # 把本次授权固化为 demo 的配置文件
 cwrap run --app demo --share network --persist -- /usr/bin/myapp
@@ -64,11 +72,12 @@ cwrap run --app demo --share network --persist -- /usr/bin/myapp
 ```toml
 app = "demo"
 seccomp = "medium"          # low | medium | high
+tmp = "sandbox"             # sandbox(默认) | sandbox:BASE | tmpfs | host | "/绝对路径"
 share = ["network"]
 socket = ["x11", "wayland"]
 device = []
 allow = []
-fs = ["ro:/opt/data"]
+fs = ["ro:/opt/data", "ro:xdg-download?"]   # 支持 flatpak 关键字，? = 不存在不报错
 dbus = [
   "session.talk=org.freedesktop.Notifications",
   "session.own=org.example.Demo",

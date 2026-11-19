@@ -20,6 +20,7 @@ type Options struct {
 	UID       int
 	HomeDir   string // 宿主侧沙箱 HOME 目录
 	SeccompFD int    // 传给 bwrap 的 BPF fd 号（0 表示不启用）
+	TmpDir    string // sandbox /tmp 模式：daemon 预创建的宿主侧私有目录（bind 模式由 daemon 填用户路径）
 
 	CmdPath string   // 双横线后解析出的可执行文件（宿主路径）
 	CmdArgs []string // 其余参数
@@ -34,6 +35,7 @@ func Args(o *Options) ([]string, error) {
 	uid := o.UID
 	a := []string{
 		"--die-with-parent",
+		"--cap-drop", "ALL",
 		// 不使用 --unshare-all：新 PID namespace 下挂载 /proc 在部分容器化
 		// 宿主上被内核限制（Operation not permitted）。显式 unshare 其余命名
 		// 空间，/proc 以只读 bind 提供（同样隔离挂载点与写入）。
@@ -41,6 +43,12 @@ func Args(o *Options) ([]string, error) {
 		"--unshare-uts",
 		"--unshare-cgroup",
 		"--clearenv",
+	}
+
+	// /tmp 处理方式（默认 sandbox：私有目录，daemon 退出时清理）
+	ts, err := perm.ParseTmp(p.Tmp)
+	if err != nil {
+		return nil, err
 	}
 
 	// seccomp（fd 由调用方通过 ExtraFiles 传入）
@@ -60,9 +68,24 @@ func Args(o *Options) ([]string, error) {
 	a = append(a, "--ro-bind", "/usr", "/usr")
 	a = append(a, rootSymlinks()...)
 	a = append(a, "--ro-bind-try", "/etc", "/etc")
-	a = append(a, "--ro-bind-try", "/proc", "/proc")
-	a = append(a, "--tmpfs", "/tmp")
+	a = append(a, "--proc", "/proc")
 	a = append(a, "--tmpfs", "/run")
+
+	// /tmp：sandbox（私有目录）| tmpfs（全空）| host（宿主）| bind（用户指定目录）
+	switch ts.Kind {
+	case "tmpfs":
+		a = append(a, "--tmpfs", "/tmp")
+	case "host":
+		a = append(a, "--bind", "/tmp", "/tmp")
+	case "bind":
+		a = append(a, "--bind", ts.Path, "/tmp")
+	default: // sandbox：daemon 已创建私有目录
+		if o.TmpDir == "" {
+			return nil, fmt.Errorf("tmp=sandbox 需要 daemon 提供私有 tmp 目录（TmpDir 为空）")
+		}
+		a = append(a, "--bind", o.TmpDir, "/tmp")
+	}
+	hostTmpExposed := ts.Kind == "host" || (ts.Kind == "bind" && ts.Path == "/tmp")
 
 	// /dev
 	if perm.Has(p.Device, "all") {
@@ -100,7 +123,11 @@ func Args(o *Options) ([]string, error) {
 	// socket 授权
 	sockEnv := map[string]string{}
 	if perm.Has(p.Socket, "x11") {
-		a = append(a, "--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix")
+		// host /tmp 已整体 bind 时 .X11-unix 已随 /tmp 可见，无需重复挂载
+		// （flatpak 同样如此；代价是该 socket 随 /tmp 变为可写）
+		if !hostTmpExposed {
+			a = append(a, "--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix")
+		}
 		if v := os.Getenv("DISPLAY"); v != "" {
 			sockEnv["DISPLAY"] = v
 		}
@@ -153,20 +180,36 @@ func Args(o *Options) ([]string, error) {
 		sockEnv["DBUS_SYSTEM_BUS_ADDRESS"] = "unix:path=/run/cwrap/systemBus"
 	}
 
-	// 额外文件系统授权
+	// 额外文件系统授权（PATH 支持 flatpak 关键字展开，可一对多）
 	extraRoots := []string{}
 	for _, fs := range p.FS {
-		mode, path, err := perm.ParseFS(fs)
+		mode, rawPath, err := perm.ParseFS(fs)
 		if err != nil {
 			return nil, err
 		}
-		switch mode {
-		case "rw":
-			a = append(a, "--bind", path, path)
-		case "ro":
-			a = append(a, "--ro-bind", path, path)
+		resolved, tryOK, err := perm.ResolveFSPath(rawPath)
+		if err != nil {
+			return nil, err
 		}
-		extraRoots = append(extraRoots, path)
+		for _, path := range resolved {
+			// host /tmp 已整体可见时跳过 /tmp 下的重复挂载
+			// （CLI 层已过滤并警告，此处兜底去重）
+			if hostTmpExposed && (path == "/tmp" || strings.HasPrefix(path, "/tmp/")) {
+				continue
+			}
+			act := "--bind"
+			if mode == "ro" {
+				act = "--ro-bind"
+			}
+			if tryOK {
+				act += "-try"
+			}
+			a = append(a, act, path, path)
+			extraRoots = append(extraRoots, path)
+		}
+	}
+	if hostTmpExposed {
+		extraRoots = append(extraRoots, "/tmp") // 自动挂载判定：/tmp 下的可执行文件已被覆盖
 	}
 
 	// 环境变量

@@ -21,6 +21,7 @@ var (
         SeccompLevels = []string{"low", "medium", "high"} // low 宽松 -> high 最严格
         FSModes       = []string{"ro", "rw"}
         DBusTargets   = []string{"session.talk", "session.own", "system.talk", "system.own"}
+        TmpKinds      = []string{"sandbox", "tmpfs", "host", "bind"} // /tmp 处理方式
 )
 
 // Permissions 是一次沙箱运行的完整权限描述。
@@ -38,13 +39,15 @@ type Permissions struct {
         EnvAdd  []string `toml:"-"`                 // 仅 FLAG：追加透传的环境变量
         DBus    []string `toml:"dbus,omitempty"`    // "session.talk=NAME" 等
         Seccomp string   `toml:"seccomp,omitempty"` // low | medium | high
+        Tmp     string   `toml:"tmp,omitempty"`     // sandbox(默认) | tmpfs | host | bind:PATH | sandbox:BASE
 
         AllowSyscalls []string `toml:"allow_syscalls,omitempty"` // 追加的 syscall 白名单
 }
 
-// Default 返回默认权限：seccomp=medium（对齐 flatpak 默认），其余全部关闭。
+// Default 返回默认权限：seccomp=medium（对齐 flatpak 默认），
+// /tmp 使用私有沙箱目录（sandbox），其余全部关闭。
 func Default() *Permissions {
-        return &Permissions{Seccomp: "medium"}
+        return &Permissions{Seccomp: "medium", Tmp: "sandbox"}
 }
 
 // Overlay 把 src 中非空字段覆盖到 dst（用于 全局配置 -> 应用配置 -> FLAG 的合并）。
@@ -60,6 +63,9 @@ func (p *Permissions) Overlay(src *Permissions) {
         }
         if src.Seccomp != "" {
                 p.Seccomp = src.Seccomp
+        }
+        if src.Tmp != "" {
+                p.Tmp = src.Tmp
         }
         p.Share = overlayList(p.Share, src.Share)
         p.Socket = overlayList(p.Socket, src.Socket)
@@ -138,23 +144,14 @@ type FSRule struct {
         Path string
 }
 
-// FSRules 解析 FS 字段（"ro:/path" / "rw:/path"）。
+// FSRules 解析 FS 字段（"ro:/path" / "rw:/path"）。PATH 支持绝对路径与
+// flatpak 风格关键字（见 fskeys.go），尾缀 ? 表示路径不存在不报错。
 func (p *Permissions) FSRules() ([]FSRule, error) {
         var rules []FSRule
         for _, tok := range p.FS {
-                idx := strings.Index(tok, ":")
-                if idx < 0 {
-                        return nil, fmt.Errorf("无效的 --fs 项 %q，期望格式 ro:PATH 或 rw:PATH", tok)
-                }
-                mode, path := tok[:idx], tok[idx+1:]
-                if !inList(FSModes, mode) {
-                        return nil, fmt.Errorf("无效的 --fs 模式 %q（可选：ro、rw）", mode)
-                }
-                if !strings.HasPrefix(path, "/") {
-                        return nil, fmt.Errorf("--fs 路径必须是绝对路径：%q", tok)
-                }
-                if path == "/" {
-                        return nil, fmt.Errorf("--fs 不允许挂载宿主根目录 /（如需完整宿主请使用 --fs rw:/path 逐项授权）")
+                mode, path, err := ParseFS(tok)
+                if err != nil {
+                        return nil, err
                 }
                 rules = append(rules, FSRule{Mode: mode, Path: path})
         }
@@ -191,6 +188,12 @@ func (p *Permissions) Validate() error {
         if _, err := p.FSRules(); err != nil {
                 return err
         }
+        if p.Tmp == "" {
+                p.Tmp = "sandbox"
+        }
+        if _, err := ParseTmp(p.Tmp); err != nil {
+                return err
+        }
         if _, err := p.DbusRules(); err != nil {
                 return err
         }
@@ -219,6 +222,7 @@ func (p *Permissions) Describe() string {
         }
         fmt.Fprintf(&b, "home     = %s\n", home)
         fmt.Fprintf(&b, "seccomp  = %s\n", p.Seccomp)
+        fmt.Fprintf(&b, "tmp      = %s\n", p.Tmp)
         if len(p.AllowSyscalls) > 0 {
                 extra := append([]string(nil), p.AllowSyscalls...)
                 sort.Strings(extra)
@@ -243,20 +247,19 @@ func (p *Permissions) Describe() string {
         return b.String()
 }
 
-// ParseFS 解析 "ro:/path" / "rw:/path" 形式的文件系统授权项。
+// ParseFS 解析 "ro:PATH" / "rw:PATH" 形式的文件系统授权项。
+// PATH 支持绝对路径与 flatpak 关键字（home、host、xdg-*、~/... 等），
+// 尾缀 ? 表示目标不存在不报错。
 func ParseFS(spec string) (mode, path string, err error) {
         mode, path, found := strings.Cut(spec, ":")
         if !found {
-                return "", "", fmt.Errorf("无效的 --fs 项 %q（应为 ro:/path 或 rw:/path）", spec)
+                return "", "", fmt.Errorf("无效的 --fs 项 %q（应为 ro:PATH 或 rw:PATH）", spec)
         }
         if !inList(FSModes, mode) {
                 return "", "", fmt.Errorf("无效的 --fs 模式 %q（可选：ro、rw）", mode)
         }
-        if !strings.HasPrefix(path, "/") {
-                return "", "", fmt.Errorf("--fs 路径必须是绝对路径：%q", spec)
-        }
-        if path == "/" {
-                return "", "", fmt.Errorf("--fs 不允许挂载宿主根目录 /（如需完整宿主请使用 --fs rw:/path 逐项授权）")
+        if err := FSPathValid(path); err != nil {
+                return "", "", err
         }
         return mode, path, nil
 }
@@ -271,4 +274,92 @@ func DefaultSeccomp(v string) string {
                 return v
         }
         return "medium"
+}
+
+// DefaultTmp 返回 /tmp 处理方式的默认值。
+func DefaultTmp() string { return "sandbox" }
+
+// TmpSetting 是解析后的 --tmp 设置。
+type TmpSetting struct {
+        Kind string // sandbox | tmpfs | host | bind
+        Base string // sandbox: 自定义私有目录的上级目录（空 = $TMPDIR）
+        Path string // bind: 作为沙箱 /tmp 的宿主目录
+}
+
+// ParseTmp 解析 --tmp 参数值：
+//
+//      sandbox        （默认）私有 tmp 目录，位于 $TMPDIR/.cwrap-tmpdir-<uid>/<app>-<id>，
+//                     由 daemon 创建并在退出后清理（对齐 sas.sh SHARE_APP_TMPDIR=0 语义）
+//      sandbox:BASE   私有 tmp 目录放在 BASE 下（BASE 必须是绝对路径），同样自动清理
+//      tmpfs          全空的 --tmpfs /tmp
+//      host           完整访问宿主 /tmp（--bind /tmp /tmp）
+//      PATH           绝对路径：把宿主 PATH bind 为沙箱 /tmp（用户自管，不自动清理）
+func ParseTmp(v string) (*TmpSetting, error) {
+        if v == "" {
+                v = DefaultTmp()
+        }
+        switch v {
+        case "sandbox", "tmpfs", "host":
+                return &TmpSetting{Kind: v}, nil
+        }
+        if strings.HasPrefix(v, "sandbox:") {
+                base := strings.TrimPrefix(v, "sandbox:")
+                if !strings.HasPrefix(base, "/") {
+                        return nil, fmt.Errorf("--tmp sandbox: 的 BASE 必须是绝对路径：%q", v)
+                }
+                return &TmpSetting{Kind: "sandbox", Base: base}, nil
+        }
+        if strings.HasPrefix(v, "/") {
+                return &TmpSetting{Kind: "bind", Path: filepath.Clean(v)}, nil
+        }
+        return nil, fmt.Errorf("无效的 --tmp 值 %q（可选：sandbox | sandbox:BASE | tmpfs | host | 绝对路径）", v)
+}
+
+// FilterTmpFSConflicts 检查 FS 授权与 --tmp 提供的 /tmp 的重叠，
+// 返回过滤后的 FS 列表与警告文案。
+//
+// 规则：
+//   - 任何模式下，--fs 指向 /tmp 本身都会与 --tmp 挂载冲突 → 过滤 + 警告；
+//   - tmp=host 时（宿主 /tmp 整体可访问），/tmp 下的子路径已被覆盖
+//     （且 ro 收窄会失效）→ 过滤 + 警告；
+//   - sandbox/tmpfs 模式下 /tmp 子路径仍可挂载进私有 /tmp，保留不动。
+func FilterTmpFSConflicts(p *Permissions) (fs []string, warnings []string) {
+        ts, err := ParseTmp(p.Tmp)
+        if err != nil {
+                return p.FS, nil // 校验错误由 Validate 负责
+        }
+        hostTmpExposed := ts.Kind == "host" || (ts.Kind == "bind" && ts.Path == "/tmp")
+        var kept []string
+        for _, tok := range p.FS {
+                _, path, err := ParseFS(tok)
+                if err != nil {
+                        kept = append(kept, tok) // 语法错误留给 Validate 报
+                        continue
+                }
+                resolved, _, err := ResolveFSPath(path)
+                if err != nil {
+                        kept = append(kept, tok)
+                        continue
+                }
+                conflict := ""
+                for _, r := range resolved {
+                        if r == "/tmp" {
+                                conflict = r
+                                break
+                        }
+                        if hostTmpExposed && strings.HasPrefix(r, "/tmp/") {
+                                conflict = r
+                                break
+                        }
+                }
+                if conflict == "" {
+                        kept = append(kept, tok)
+                        continue
+                }
+                warnings = append(warnings, fmt.Sprintf(
+                        "警告: --fs %s 的挂载点 %s 已由 --tmp %s 提供的 /tmp 覆盖，该项已被忽略；"+
+                                "如需指定 /tmp 内容请使用 --tmp 参数（如 --tmp host 或 --tmp /path/to/dir）",
+                        tok, conflict, p.Tmp))
+        }
+        return kept, warnings
 }

@@ -18,3 +18,6 @@ dbus = [
 seccomp = "medium"           # low | medium | high
 allow_syscalls = []
 env = []
+
+# /tmp 处理（默认 sandbox：私有目录，退出由 daemon 清理）
+# tmp = "sandbox"        # sandbox(默认) | sandbox:BASE | tmpfs(全空) | host(宿主 /tmp) | "/绝对路径"

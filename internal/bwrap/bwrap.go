@@ -36,10 +36,8 @@ func Args(o *Options) ([]string, error) {
 	a := []string{
 		"--die-with-parent",
 		"--cap-drop", "ALL",
-		// 不使用 --unshare-all：新 PID namespace 下挂载 /proc 在部分容器化
-		// 宿主上被内核限制（Operation not permitted）。显式 unshare 其余命名
-		// 空间，/proc 以只读 bind 提供（同样隔离挂载点与写入）。
 		"--unshare-user",
+		"--unshare-pid",
 		"--unshare-uts",
 		"--unshare-cgroup",
 		"--clearenv",

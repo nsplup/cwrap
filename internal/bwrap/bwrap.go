@@ -94,6 +94,8 @@ func Args(o *Options) ([]string, error) {
 		a = append(a, "--dev", "/dev")
 		if perm.Has(p.Device, "dri") {
 			a = append(a, "--dev-bind-try", "/dev/dri", "/dev/dri")
+			a = append(a, "--ro-bind-try", "/sys/dev/char", "/sys/dev/char")
+			a = append(a, "--ro-bind-try", "/sys/devices", "/sys/devices")
 		}
 		if perm.Has(p.Device, "kvm") {
 			a = append(a, "--dev-bind-try", "/dev/kvm", "/dev/kvm")

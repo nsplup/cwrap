@@ -220,7 +220,9 @@ func runViaDaemon(spec *perm.Permissions, argv []string) int {
 			Ok       *bool   `json:"ok"`
 			Error    string  `json:"error"`
 			ExitCode int     `json:"exit_code"`
+			Signal   int     `json:"signal"`
 		}
+
 		line, rerr := br.ReadBytes('\n')
 		if rerr != nil {
 			// daemon 失联（崩溃/被 kill/异常退出）：
@@ -260,8 +262,19 @@ func runViaDaemon(spec *perm.Permissions, argv []string) int {
 				fmt.Fprintln(os.Stderr, "错误:", frame.Error)
 				return 255
 			}
+			// 新版 daemon：进程被信号终止 → 按 shell 惯例 128+sig
+			if frame.Signal != 0 {
+				fmt.Fprintf(os.Stderr, "cwrap: 进程被信号 %d 终止\n", frame.Signal)
+				return 128 + frame.Signal
+			}
+			// 旧版 daemon 兼容：被信号终止的 ExitCode 是误导性的 -1
+			if frame.ExitCode < 0 {
+				fmt.Fprintln(os.Stderr, "cwrap: 进程异常终止")
+				return 255
+			}
 			return frame.ExitCode
 		}
+
 	}
 
 }

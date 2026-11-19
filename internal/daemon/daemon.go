@@ -34,11 +34,12 @@ import (
 const IdleTimeout = 30 * time.Second
 
 type runEntry struct {
-	id   string
-	app  string
-	pgid int
-	cmd  *exec.Cmd
-	dir  string
+	id         string
+	app        string
+	pgid       int
+	cmd        *exec.Cmd
+	dir        string
+	startTicks uint64 // bwrap 的 /proc starttime，供 killGroupSafe 校验 pgid 归属
 }
 
 type Server struct {
@@ -101,6 +102,51 @@ func Run() error {
 	}
 }
 
+// procStartTicks 读取 /proc/<pid>/stat 的 starttime（第 22 字段，clock tick）。
+// 进程存活期间该值不变，是区分"pgid 被内核回收复用"的唯一可靠依据。
+func procStartTicks(pid int) (uint64, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	// comm 可含空格与括号，从最后一个 ')' 之后切分
+	i := bytes.LastIndexByte(data, ')')
+	if i < 0 || i+2 > len(data) {
+		return 0, fmt.Errorf("stat 格式异常")
+	}
+	fields := strings.Fields(string(data[i+2:])) // fields[0] = state(第3字段)
+	if len(fields) < 20 {
+		return 0, fmt.Errorf("stat 字段不足")
+	}
+	return strconv.ParseUint(fields[19], 10, 64) // 第22字段 => fields[19]
+}
+
+// killGroupSafe 向沙箱进程组发信号。发送前用 starttime 校验 pgid 仍属于
+// 当初启动的 bwrap，防止组退出后 pgid 被复用导致误杀。
+func killGroupSafe(e *runEntry, sig syscall.Signal) {
+	if e == nil || e.pgid <= 0 {
+		return
+	}
+	if e.startTicks == 0 {
+		syscall.Kill(-e.pgid, sig) // 启动瞬间没读到：回退直发，保可用性
+		return
+	}
+	cur, err := procStartTicks(e.pgid)
+	if err != nil || cur != e.startTicks {
+		return // 组已退出或 pgid 已被复用：不补刀
+	}
+	syscall.Kill(-e.pgid, sig)
+}
+
+// devNullFD 供 ping 探活时填充协议要求的 3 个 stdio FD。
+func devNullFD() int {
+	f, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return -1
+	}
+	return int(f.Fd())
+}
+
 func ipcSocket() string {
 	p, _ := ipc.SocketPath()
 	return p
@@ -131,6 +177,12 @@ func (s *Server) idleLoop() {
 			t.Reset(IdleTimeout)
 		case <-t.C:
 			s.mu.Lock()
+			for id, r := range s.runs {
+				// 进程组已不存在：回收泄漏的 entry
+				if syscall.Kill(r.pgid, 0) != nil {
+					delete(s.runs, id)
+				}
+			}
 			n := len(s.runs)
 			s.mu.Unlock()
 			if n == 0 {
@@ -138,6 +190,7 @@ func (s *Server) idleLoop() {
 				os.Exit(0)
 			}
 			t.Reset(IdleTimeout)
+
 		}
 	}
 }
@@ -148,10 +201,22 @@ func (s *Server) shutdown() {
 	s.ln.Close()
 	os.Remove(s.socket)
 	for _, r := range s.runs {
-		if r.pgid > 0 {
-			syscall.Kill(-r.pgid, syscall.SIGTERM)
-		}
+		killGroupSafe(r, syscall.SIGTERM)
 	}
+	// 宽限后强制回收，避免异常沙箱在 daemon 退出后残留
+	go func(entries []*runEntry) {
+		time.Sleep(2 * time.Second)
+		for _, r := range entries {
+			killGroupSafe(r, syscall.SIGKILL)
+		}
+		os.Exit(0)
+	}(func() []*runEntry {
+		out := make([]*runEntry, 0, len(s.runs))
+		for _, r := range s.runs {
+			out = append(out, r)
+		}
+		return out
+	}())
 }
 
 // cleanStale 清扫 pid 已死的陈旧运行目录。
@@ -209,9 +274,12 @@ func (s *Server) handle(conn net.Conn) {
 		s.handlePS(uc)
 	case "kill":
 		s.handleKill(uc, req.Target)
+	case "ping":
+		ipc.WriteJSON(uc, ipc.Response{Ok: true})
 	default:
 		ipc.WriteJSON(uc, ipc.Response{Ok: false, Error: "未知命令 " + req.Cmd})
 	}
+
 }
 
 func (s *Server) handlePS(uc *net.UnixConn) {
@@ -238,10 +306,10 @@ func (s *Server) handleKill(uc *net.UnixConn, target string) {
 		ipc.WriteJSON(uc, ipc.Response{Ok: false, Error: "未找到运行中的沙箱: " + target})
 		return
 	}
-	syscall.Kill(-victim.pgid, syscall.SIGTERM)
+	killGroupSafe(victim, syscall.SIGTERM)
 	go func(e *runEntry) {
 		time.Sleep(3 * time.Second)
-		syscall.Kill(-e.pgid, syscall.SIGKILL)
+		killGroupSafe(victim, syscall.SIGKILL)
 	}(victim)
 	ipc.WriteJSON(uc, ipc.Response{Ok: true})
 }
@@ -361,12 +429,20 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		ipc.WriteJSON(uc, ipc.Response{Ok: false, Error: "启动 bwrap: " + err.Error() + "（请确认已安装 bubblewrap）"})
 		return
 	}
-
-	entry := &runEntry{id: id, app: spec.App, cmd: cmd, dir: dir, pgid: cmd.Process.Pid}
+	st, _ := procStartTicks(cmd.Process.Pid) // 失败为 0，killGroupSafe 会回退直发
+	entry := &runEntry{id: id, app: spec.App, cmd: cmd, dir: dir,
+		pgid: cmd.Process.Pid, startTicks: st}
 	s.mu.Lock()
 	s.runs[id] = entry
 	s.mu.Unlock()
 	s.resetIdle()
+	// entry 一定被移除：无论正常结束、卡死后被 KILL、还是异常路径
+	defer func() {
+		s.mu.Lock()
+		delete(s.runs, id)
+		s.mu.Unlock()
+		s.resetIdle()
+	}()
 
 	// 通知客户端子进程组（交互程序 tcsetpgrp 需要）
 	ipc.WriteJSON(uc, ipc.Event{Event: "started", ID: id, App: spec.App, PGID: entry.pgid})
@@ -379,8 +455,11 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		for {
 			var m ipc.SignalMsg
 			if err := ipc.ReadJSON(br, &m); err != nil {
-				// 客户端断开或出错：终止沙箱进程组
-				syscall.Kill(-entry.pgid, syscall.SIGTERM)
+				killGroupSafe(entry, syscall.SIGTERM)
+				go func(e *runEntry) {
+					time.Sleep(2 * time.Second)
+					killGroupSafe(e, syscall.SIGKILL)
+				}(entry)
 				return
 			}
 			if m.Cmd == "signal" {
@@ -400,9 +479,14 @@ loop:
 	for {
 		select {
 		case sig := <-sigCh:
-			syscall.Kill(-entry.pgid, syscall.Signal(sig))
+			killGroupSafe(entry, syscall.Signal(sig))
 		case <-done:
-			waitErr = <-waitCh
+			select {
+			case waitErr = <-waitCh:
+			case <-time.After(3 * time.Second):
+				killGroupSafe(entry, syscall.SIGKILL)
+				waitErr = <-waitCh
+			}
 			break loop
 		case waitErr = <-waitCh:
 			break loop
@@ -410,21 +494,28 @@ loop:
 	}
 
 	// 清理并应答
-	s.mu.Lock()
-	delete(s.runs, id)
-	s.mu.Unlock()
 	s.resetIdle()
 
 	resp := ipc.Response{Ok: true}
 	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
-			resp.ExitCode = ee.ExitCode()
+			ws, _ := ee.Sys().(syscall.WaitStatus)
+			switch {
+			case ws.Signaled():
+				resp.ExitCode = -1
+				resp.Signal = int(ws.Signal())
+			case ws.Exited():
+				resp.ExitCode = ws.ExitStatus()
+			default:
+				resp.ExitCode = ee.ExitCode()
+			}
 		} else {
 			resp.Ok = false
 			resp.Error = waitErr.Error()
 		}
 	}
 	ipc.WriteJSON(uc, resp)
+
 }
 
 func proxyPath(p *dbusproxy.Proxy, def string) string {
@@ -448,6 +539,9 @@ func EnsureRunning() error {
 	if daemonAlive(sock) {
 		return nil
 	}
+	// socket 文件残留但对 ping 无应答（wedged/stopped 的旧 daemon）：清掉重绑
+	_ = os.Remove(sock)
+
 	base := filepath.Join(runtimeDir(), "cwrap")
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		return err
@@ -457,6 +551,7 @@ func EnsureRunning() error {
 		return err
 	}
 	defer logf.Close()
+
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -464,9 +559,16 @@ func EnsureRunning() error {
 	cmd := exec.Command(exe, "daemon")
 	cmd.Stdout = logf
 	cmd.Stderr = logf
+	// 关键：新会话 + 脱离控制终端 + 自成进程组。
+	// 不做这一步，daemon 会继承客户端的 pgid/会话/tty，
+	// 落入终端 job control 的 T（stopped）状态：SIGTERM 挂起、
+	// 定时器冻结（闲时退出失效），只能 SIGKILL。
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("拉起 cwrapd: %w", err)
 	}
+	cmd.Process.Release() // 客户端不等待 daemon，避免僵尸
+
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if daemonAlive(sock) {
@@ -477,11 +579,23 @@ func EnsureRunning() error {
 	return fmt.Errorf("cwrapd 未能在 3 秒内就绪（日志: %s）", filepath.Join(base, "cwrapd.log"))
 }
 
+// daemonAlive 真探活：拨通 socket 还不够——内核会代答 connect，
+// 即使监听进程处于 stopped 状态也能拨通。必须走一轮完整 ping 应答。
 func daemonAlive(sock string) bool {
 	conn, err := net.DialTimeout("unix", sock, 300*time.Millisecond)
 	if err != nil {
 		return false
 	}
-	conn.Close()
-	return true
+	defer conn.Close()
+	uc := conn.(*net.UnixConn)
+	nulls := []int{devNullFD(), devNullFD(), devNullFD()}
+	if err := ipc.SendFDs(uc, nulls); err != nil {
+		return false
+	}
+	if err := ipc.WriteJSON(uc, ipc.Request{Cmd: "ping"}); err != nil {
+		return false
+	}
+	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	var resp ipc.Response
+	return ipc.ReadJSON(bufio.NewReader(uc), &resp) == nil && resp.Ok
 }

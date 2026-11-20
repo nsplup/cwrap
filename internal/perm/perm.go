@@ -2,6 +2,9 @@
 //
 // 语义对齐 Flatpak，但更直白：默认零权限，所有能力都需要通过
 // FLAG 或 TOML 配置文件显式授予。
+//
+// 合并规则（全局配置 -> 应用配置 -> 命令行 FLAG）：
+// 标量字段非空覆盖；列表字段累加并去除完全重复的值。
 package perm
 
 import (
@@ -21,14 +24,14 @@ var (
         SeccompLevels = []string{"low", "medium", "high"} // low 宽松 -> high 最严格
         FSModes       = []string{"ro", "rw"}
         DBusTargets   = []string{"session.talk", "session.own", "system.talk", "system.own"}
-        TmpKinds      = []string{"sandbox", "tmpfs", "host", "bind"} // /tmp 处理方式
+        TmpKinds      = []string{"tmpfs", "host"} // /tmp 处理方式
 )
 
 // Permissions 是一次沙箱运行的完整权限描述。
 // 所有切片字段表示"授予列表"，空表示未授予。
 type Permissions struct {
-        App  string `toml:"app"`            // 应用名，决定 HOME 目录与配置文件
-        Home string `toml:"home,omitempty"` // 自定义沙箱 HOME 目录（默认 $HOME/.var/sandbox/<App>）
+        App  string `toml:"app"`            // 应用名，决定 HOME 目录与配置文件（可省略）
+        Home string `toml:"home,omitempty"` // 自定义沙箱 HOME 目录（默认 $HOME/.var/sandbox/<App>，无 App 时为 $HOME/.var/sandbox/home）
 
         Share   []string `toml:"share,omitempty"`   // network, ipc
         Socket  []string `toml:"socket,omitempty"`  // x11, wayland, pulseaudio, pipewire, cups, pcsc, ssh-agent
@@ -36,21 +39,21 @@ type Permissions struct {
         Allow   []string `toml:"allow,omitempty"`   // devel, multiarch
         FS      []string `toml:"fs,omitempty"`      // "ro:/path" 或 "rw:/path"
         Env     []string `toml:"env,omitempty"`     // "KEY=VALUE"
-        EnvAdd  []string `toml:"-"`                 // 仅 FLAG：追加透传的环境变量
         DBus    []string `toml:"dbus,omitempty"`    // "session.talk=NAME" 等
         Seccomp string   `toml:"seccomp,omitempty"` // low | medium | high
-        Tmp     string   `toml:"tmp,omitempty"`     // sandbox(默认) | tmpfs | host | bind:PATH | sandbox:BASE
+        Tmp     string   `toml:"tmp,omitempty"`     // tmpfs(默认) | host
 
         AllowSyscalls []string `toml:"allow_syscalls,omitempty"` // 追加的 syscall 白名单
 }
 
 // Default 返回默认权限：seccomp=medium（对齐 flatpak 默认），
-// /tmp 使用私有沙箱目录（sandbox），其余全部关闭。
+// /tmp 使用全空 tmpfs，其余全部关闭。
 func Default() *Permissions {
-        return &Permissions{Seccomp: "medium", Tmp: "sandbox"}
+        return &Permissions{Seccomp: "medium", Tmp: "tmpfs"}
 }
 
-// Overlay 把 src 中非空字段覆盖到 dst（用于 全局配置 -> 应用配置 -> FLAG 的合并）。
+// Overlay 把 src 中非空字段合并到 dst（用于 全局配置 -> 应用配置 -> FLAG 的合并）。
+// 标量字段：非空覆盖；列表字段：累加并去除完全重复的值。
 func (p *Permissions) Overlay(src *Permissions) {
         if src == nil {
                 return
@@ -67,22 +70,42 @@ func (p *Permissions) Overlay(src *Permissions) {
         if src.Tmp != "" {
                 p.Tmp = src.Tmp
         }
-        p.Share = overlayList(p.Share, src.Share)
-        p.Socket = overlayList(p.Socket, src.Socket)
-        p.Device = overlayList(p.Device, src.Device)
-        p.Allow = overlayList(p.Allow, src.Allow)
-        p.FS = overlayList(p.FS, src.FS)
-        p.Env = overlayList(p.Env, src.Env)
-        p.DBus = overlayList(p.DBus, src.DBus)
-        p.AllowSyscalls = overlayList(p.AllowSyscalls, src.AllowSyscalls)
-        p.EnvAdd = overlayList(p.EnvAdd, src.EnvAdd)
+        p.Share = OverlayList(p.Share, src.Share)
+        p.Socket = OverlayList(p.Socket, src.Socket)
+        p.Device = OverlayList(p.Device, src.Device)
+        p.Allow = OverlayList(p.Allow, src.Allow)
+        p.FS = OverlayList(p.FS, src.FS)
+        p.Env = OverlayList(p.Env, src.Env)
+        p.DBus = OverlayList(p.DBus, src.DBus)
+        p.AllowSyscalls = OverlayList(p.AllowSyscalls, src.AllowSyscalls)
 }
 
-func overlayList(base, overlay []string) []string {
+// OverlayList 合并两份授予列表：累加后仅去除完全重复的值，保持原有顺序。
+func OverlayList(base, overlay []string) []string {
         if len(overlay) == 0 {
-                return base
+                return Dedupe(base)
         }
-        return overlay
+        merged := make([]string, 0, len(base)+len(overlay))
+        merged = append(merged, base...)
+        merged = append(merged, overlay...)
+        return Dedupe(merged)
+}
+
+// Dedupe 去除列表中完全重复的值，保持首次出现的顺序。
+func Dedupe(list []string) []string {
+        if len(list) == 0 {
+                return list
+        }
+        seen := make(map[string]struct{}, len(list))
+        out := make([]string, 0, len(list))
+        for _, v := range list {
+                if _, ok := seen[v]; ok {
+                        continue
+                }
+                seen[v] = struct{}{}
+                out = append(out, v)
+        }
+        return out
 }
 
 func inList(list []string, v string) bool {
@@ -160,9 +183,6 @@ func (p *Permissions) FSRules() ([]FSRule, error) {
 
 // Validate 校验整份权限描述。
 func (p *Permissions) Validate() error {
-        if p.App == "" {
-                return fmt.Errorf("缺少应用名：请通过 --app 或配置文件指定")
-        }
         if p.Seccomp == "" {
                 p.Seccomp = "medium"
         }
@@ -189,7 +209,7 @@ func (p *Permissions) Validate() error {
                 return err
         }
         if p.Tmp == "" {
-                p.Tmp = "sandbox"
+                p.Tmp = "tmpfs"
         }
         if _, err := ParseTmp(p.Tmp); err != nil {
                 return err
@@ -200,16 +220,21 @@ func (p *Permissions) Validate() error {
         return nil
 }
 
-// HomeDirHost 返回宿主侧沙箱 HOME 目录（默认 $HOME/.var/sandbox/<App>）。
+// HomeDirHost 返回宿主侧沙箱 HOME 目录（默认 $HOME/.var/sandbox/<App>；
+// 未指定应用名时使用 $HOME/.var/sandbox/home）。
 func (p *Permissions) HomeDirHost() string {
         if p.Home != "" {
                 return p.Home
+        }
+        name := p.App
+        if name == "" {
+                name = "home"
         }
         base, err := os.UserHomeDir()
         if err != nil || base == "" {
                 base = "/tmp"
         }
-        return filepath.Join(base, ".var", "sandbox", p.App)
+        return filepath.Join(base, ".var", "sandbox", name)
 }
 
 // Describe 生成人类可读的权限摘要（permission show 用）。
@@ -218,7 +243,11 @@ func (p *Permissions) Describe() string {
         fmt.Fprintf(&b, "app      = %s\n", p.App)
         home := p.Home
         if home == "" {
-                home = fmt.Sprintf("$HOME/.var/sandbox/%s (默认)", p.App)
+                name := p.App
+                if name == "" {
+                        name = "home"
+                }
+                home = fmt.Sprintf("$HOME/.var/sandbox/%s (默认)", name)
         }
         fmt.Fprintf(&b, "home     = %s\n", home)
         fmt.Fprintf(&b, "seccomp  = %s\n", p.Seccomp)
@@ -277,42 +306,26 @@ func DefaultSeccomp(v string) string {
 }
 
 // DefaultTmp 返回 /tmp 处理方式的默认值。
-func DefaultTmp() string { return "sandbox" }
+func DefaultTmp() string { return "tmpfs" }
 
 // TmpSetting 是解析后的 --tmp 设置。
 type TmpSetting struct {
-        Kind string // sandbox | tmpfs | host | bind
-        Base string // sandbox: 自定义私有目录的上级目录（空 = $TMPDIR）
-        Path string // bind: 作为沙箱 /tmp 的宿主目录
+        Kind string // tmpfs | host
 }
 
 // ParseTmp 解析 --tmp 参数值：
 //
-//      sandbox        （默认）私有 tmp 目录，位于 $TMPDIR/.cwrap-tmpdir-<uid>/<app>-<id>，
-//                     由 daemon 创建并在退出后清理（对齐 sas.sh SHARE_APP_TMPDIR=0 语义）
-//      sandbox:BASE   私有 tmp 目录放在 BASE 下（BASE 必须是绝对路径），同样自动清理
-//      tmpfs          全空的 --tmpfs /tmp
+//      tmpfs          （默认）全空的 --tmpfs /tmp
 //      host           完整访问宿主 /tmp（--bind /tmp /tmp）
-//      PATH           绝对路径：把宿主 PATH bind 为沙箱 /tmp（用户自管，不自动清理）
 func ParseTmp(v string) (*TmpSetting, error) {
         if v == "" {
                 v = DefaultTmp()
         }
         switch v {
-        case "sandbox", "tmpfs", "host":
+        case "tmpfs", "host":
                 return &TmpSetting{Kind: v}, nil
         }
-        if strings.HasPrefix(v, "sandbox:") {
-                base := strings.TrimPrefix(v, "sandbox:")
-                if !strings.HasPrefix(base, "/") {
-                        return nil, fmt.Errorf("--tmp sandbox: 的 BASE 必须是绝对路径：%q", v)
-                }
-                return &TmpSetting{Kind: "sandbox", Base: base}, nil
-        }
-        if strings.HasPrefix(v, "/") {
-                return &TmpSetting{Kind: "bind", Path: filepath.Clean(v)}, nil
-        }
-        return nil, fmt.Errorf("无效的 --tmp 值 %q（可选：sandbox | sandbox:BASE | tmpfs | host | 绝对路径）", v)
+        return nil, fmt.Errorf("无效的 --tmp 值 %q（可选：tmpfs | host）", v)
 }
 
 // FilterTmpFSConflicts 检查 FS 授权与 --tmp 提供的 /tmp 的重叠，
@@ -322,13 +335,13 @@ func ParseTmp(v string) (*TmpSetting, error) {
 //   - 任何模式下，--fs 指向 /tmp 本身都会与 --tmp 挂载冲突 → 过滤 + 警告；
 //   - tmp=host 时（宿主 /tmp 整体可访问），/tmp 下的子路径已被覆盖
 //     （且 ro 收窄会失效）→ 过滤 + 警告；
-//   - sandbox/tmpfs 模式下 /tmp 子路径仍可挂载进私有 /tmp，保留不动。
+//   - tmpfs 模式下 /tmp 子路径仍可挂载进空 tmpfs，保留不动。
 func FilterTmpFSConflicts(p *Permissions) (fs []string, warnings []string) {
         ts, err := ParseTmp(p.Tmp)
         if err != nil {
                 return p.FS, nil // 校验错误由 Validate 负责
         }
-        hostTmpExposed := ts.Kind == "host" || (ts.Kind == "bind" && ts.Path == "/tmp")
+        hostTmpExposed := ts.Kind == "host"
         var kept []string
         for _, tok := range p.FS {
                 _, path, err := ParseFS(tok)
@@ -358,7 +371,7 @@ func FilterTmpFSConflicts(p *Permissions) (fs []string, warnings []string) {
                 }
                 warnings = append(warnings, fmt.Sprintf(
                         "警告: --fs %s 的挂载点 %s 已由 --tmp %s 提供的 /tmp 覆盖，该项已被忽略；"+
-                                "如需指定 /tmp 内容请使用 --tmp 参数（如 --tmp host 或 --tmp /path/to/dir）",
+                                "如需指定 /tmp 内容请使用 --tmp 参数（如 --tmp host）",
                         tok, conflict, p.Tmp))
         }
         return kept, warnings

@@ -1,5 +1,6 @@
-# 全局默认配置示例。复制到 ~/.config/cwrap/cwrap.toml
+# 全局默认配置示例。复制到 ~/.config/cwrap/global.toml
 # 优先级：全局 < 应用(~/.config/cwrap/apps/<app>.toml) < 命令行 FLAG
+# 列表字段在合并时累加并去除完全重复的值；标量字段非空覆盖
 
 app = "demo"
 # home = "/srv/sandbox/demo"
@@ -19,5 +20,5 @@ seccomp = "medium"           # low | medium | high
 allow_syscalls = []
 env = []
 
-# /tmp 处理（默认 sandbox：私有目录，退出由 daemon 清理）
-# tmp = "sandbox"        # sandbox(默认) | sandbox:BASE | tmpfs(全空) | host(宿主 /tmp) | "/绝对路径"
+# /tmp 处理（默认 tmpfs：全空临时目录）
+# tmp = "tmpfs"           # tmpfs(默认，全空) | host(宿主 /tmp)

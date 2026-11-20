@@ -23,35 +23,37 @@ import (
 )
 
 // flagPerm 解析 run/permission 共用的权限 FLAG。
-// 返回 flagSet 之外的剩余参数（-- 之后的命令行）。
-func flagPerm(args []string) (*perm.Permissions, []string, bool, bool, error) {
+// 返回 -- 之后的剩余命令行、是否 --no-global。
+func flagPerm(args []string) (*perm.Permissions, []string, bool, bool, bool, error) {
         p := &perm.Permissions{}
         fs := flag.NewFlagSet("run", flag.ContinueOnError)
         fs.SetOutput(os.Stderr)
         var share, socket, device, allow, fsSpecs, dbus, env, syscalls strSlice
-        fs.StringVar(&p.App, "app", "", "应用名")
+        fs.StringVar(&p.App, "app", "", "应用名（可省略，省略时 HOME 默认 $HOME/.var/sandbox/home）")
         fs.StringVar(&p.Home, "home", "", "自定义沙箱 HOME 目录")
         fs.Var(&share, "share", "共享: network,ipc")
         fs.Var(&socket, "socket", "socket: x11,wayland,pulseaudio,pipewire,cups,pcsc,ssh-agent")
         fs.Var(&device, "device", "设备: dri,kvm,all")
         fs.Var(&allow, "allow", "特性: devel,multiarch")
         fs.Var(&fsSpecs, "fs", "文件系统: rw:/path 或 ro:/path（支持 flatpak 关键字，详见 docs/permissions.md）")
-        fs.StringVar(&p.Tmp, "tmp", "", "/tmp 处理: sandbox(默认)|sandbox:BASE|tmpfs|host|/自定义路径")
+        fs.StringVar(&p.Tmp, "tmp", "", "/tmp 处理: tmpfs(默认)|host")
         fs.Var(&dbus, "dbus", "D-Bus: session.talk=NAME 等")
         fs.StringVar(&p.Seccomp, "seccomp", "", "过滤等级: low|medium|high")
         fs.Var(&syscalls, "allow-syscall", "追加白名单 syscall")
         fs.Var(&env, "env", "环境变量 KEY=VALUE")
+        noGlobal := fs.Bool("no-global", false, "跳过全局配置合并（global.toml）")
         persist := fs.Bool("persist", false, "保存授权为应用配置")
         dry := fs.Bool("dry-run", false, "只打印 bwrap 命令行")
         if err := fs.Parse(args); err != nil {
-                return nil, nil, false, false, err
+                return nil, nil, false, false, false, err
         }
         p.Share, p.Socket, p.Device, p.Allow = share, socket, device, allow
         p.FS, p.DBus, p.Env, p.AllowSyscalls = fsSpecs, dbus, env, syscalls
-        return p, fs.Args(), *persist, *dry, nil
+        return p, fs.Args(), *noGlobal, *persist, *dry, nil
 }
 
-// mergeFlags 把 FLAG 值覆盖到配置合并结果上（FLAG 非空才覆盖）。
+// mergeFlags 把 FLAG 值合并到配置合并结果上：
+// 标量字段非空覆盖；列表字段累加并去除完全重复的值。
 func mergeFlags(base *perm.Permissions, f *perm.Permissions) *perm.Permissions {
         m := *base
         if f.App != "" {
@@ -66,35 +68,19 @@ func mergeFlags(base *perm.Permissions, f *perm.Permissions) *perm.Permissions {
         if f.Tmp != "" {
                 m.Tmp = f.Tmp
         }
-        if len(f.Share) > 0 {
-                m.Share = f.Share
-        }
-        if len(f.Socket) > 0 {
-                m.Socket = f.Socket
-        }
-        if len(f.Device) > 0 {
-                m.Device = f.Device
-        }
-        if len(f.Allow) > 0 {
-                m.Allow = f.Allow
-        }
-        if len(f.FS) > 0 {
-                m.FS = f.FS
-        }
-        if len(f.DBus) > 0 {
-                m.DBus = f.DBus
-        }
-        if len(f.Env) > 0 {
-                m.Env = f.Env
-        }
-        if len(f.AllowSyscalls) > 0 {
-                m.AllowSyscalls = append(m.AllowSyscalls, f.AllowSyscalls...)
-        }
+        m.Share = perm.OverlayList(m.Share, f.Share)
+        m.Socket = perm.OverlayList(m.Socket, f.Socket)
+        m.Device = perm.OverlayList(m.Device, f.Device)
+        m.Allow = perm.OverlayList(m.Allow, f.Allow)
+        m.FS = perm.OverlayList(m.FS, f.FS)
+        m.DBus = perm.OverlayList(m.DBus, f.DBus)
+        m.Env = perm.OverlayList(m.Env, f.Env)
+        m.AllowSyscalls = perm.OverlayList(m.AllowSyscalls, f.AllowSyscalls)
         return &m
 }
 
 func cmdRun(argv []string) int {
-        flags, rest, persist, dry, err := flagPerm(argv)
+        flags, rest, noGlobal, persist, dry, err := flagPerm(argv)
         if err != nil {
                 return 2
         }
@@ -103,13 +89,16 @@ func cmdRun(argv []string) int {
                 return 2
         }
 
-        // 配置合并：全局 < 应用 < FLAG
-        global, _ := config.LoadGlobal()
+        // 配置合并：全局 < 应用 < FLAG（--no-global 跳过全局配置）
+        merged := &perm.Permissions{}
+        if !noGlobal {
+                global, _ := config.LoadGlobal()
+                merged = global
+        }
         if flags.App != "" {
                 appCfg, _ := config.LoadApp(flags.App)
-                global.Overlay(appCfg)
+                merged.Overlay(appCfg)
         }
-        merged := global
         merged = mergeFlags(merged, flags)
         merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
         if merged.Tmp == "" {
@@ -135,12 +124,12 @@ func cmdRun(argv []string) int {
                 fmt.Fprintln(os.Stderr, "权限错误:", err)
                 return 2
         }
-        if merged.App == "" {
-                fmt.Fprintln(os.Stderr, "错误: 必须通过 --app 或配置文件提供应用名")
-                return 2
-        }
 
         if persist {
+                if merged.App == "" {
+                        fmt.Fprintln(os.Stderr, "错误: --persist 需要应用名（--app 或配置文件）")
+                        return 2
+                }
                 if err := config.SaveApp(merged); err != nil {
                         fmt.Fprintln(os.Stderr, "保存配置失败:", err)
                         return 1
@@ -325,21 +314,24 @@ func cmdPermission(argv []string) int {
         sub, rest := argv[0], argv[1:]
         switch sub {
         case "show":
-                flags, restPos, _, _, err := flagPerm(rest)
+                flags, restPos, noGlobal, _, _, err := flagPerm(rest)
                 if err != nil {
                         return 2
                 }
-                merged, _ := config.LoadGlobal()
+                merged := &perm.Permissions{}
+                if !noGlobal {
+                        merged, _ = config.LoadGlobal()
+                }
                 name := flags.App
                 if name == "" && len(restPos) > 0 && !strings.HasPrefix(restPos[0], "-") {
                         name = restPos[0]
                 }
                 if name == "" {
-                        // show 不带 app 时展示全局+FLAG
+                        // show 不带 app 时展示（全局+）FLAG
                         merged = mergeFlags(merged, flags)
                         merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
                         if merged.Tmp == "" {
-                        	merged.Tmp = perm.DefaultTmp()
+                                merged.Tmp = perm.DefaultTmp()
                         }
                         merged.App = "(未指定)"
                 } else {
@@ -348,7 +340,7 @@ func cmdPermission(argv []string) int {
                         merged = mergeFlags(merged, flags)
                         merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
                         if merged.Tmp == "" {
-                        	merged.Tmp = perm.DefaultTmp()
+                                merged.Tmp = perm.DefaultTmp()
                         }
                 }
                 fmt.Print(merged.Describe())
@@ -358,7 +350,7 @@ func cmdPermission(argv []string) int {
                         fmt.Fprintln(os.Stderr, "用法: cwrap permission export APP [FLAGS...]")
                         return 2
                 }
-                flags, _, _, _, err := flagPerm(rest)
+                flags, _, noGlobal, _, _, err := flagPerm(rest)
                 if err != nil {
                         return 2
                 }
@@ -371,11 +363,14 @@ func cmdPermission(argv []string) int {
                         return 2
                 }
                 flags.App = name
-                merged, _ := config.LoadGlobal()
+                merged := &perm.Permissions{}
+                if !noGlobal {
+                        merged, _ = config.LoadGlobal()
+                }
                 merged = mergeFlags(merged, flags)
                 merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
                 if merged.Tmp == "" {
-                	merged.Tmp = perm.DefaultTmp()
+                        merged.Tmp = perm.DefaultTmp()
                 }
                 if err := merged.Validate(); err != nil {
                         fmt.Fprintln(os.Stderr, "权限错误:", err)

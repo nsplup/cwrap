@@ -17,7 +17,7 @@ func baseOpts(t *testing.T, tmp string) *Options {
         p := perm.Default()
         p.App = "demo"
         p.Tmp = tmp
-        return &Options{Perm: p, UID: 1000, HomeDir: t.TempDir(), TmpDir: "/tmp/.cwrap-tmpdir-1000/demo-123"}
+        return &Options{Perm: p, UID: 1000, HomeDir: t.TempDir()}
 }
 
 // 基线必须包含 --cap-drop ALL。
@@ -48,24 +48,6 @@ func TestTmpModes(t *testing.T) {
         }
         if !argHas(a, "--bind", "/tmp", "/tmp") {
                 t.Fatal("host 模式缺少 --bind /tmp /tmp")
-        }
-
-        // sandbox：bind daemon 提供的私有目录
-        a, err = Args(baseOpts(t, "sandbox"))
-        if err != nil {
-                t.Fatal(err)
-        }
-        if !argHas(a, "--bind", "/tmp/.cwrap-tmpdir-1000/demo-123", "/tmp") {
-                t.Fatal("sandbox 模式未绑定私有目录")
-        }
-
-        // bind：用户指定目录
-        a, err = Args(baseOpts(t, "/opt/mytmp"))
-        if err != nil {
-                t.Fatal(err)
-        }
-        if !argHas(a, "--bind", "/opt/mytmp", "/tmp") {
-                t.Fatal("bind 模式未绑定用户目录")
         }
 }
 
@@ -117,13 +99,13 @@ func TestX11BindDedup(t *testing.T) {
                 t.Fatal("host 模式应跳过 /tmp/.X11-unix 重复挂载")
         }
 
-        o2 := baseOpts(t, "sandbox")
+        o2 := baseOpts(t, "tmpfs")
         o2.Perm.Socket = []string{"x11"}
         a2, err := Args(o2)
         if err != nil {
                 t.Fatal(err)
         }
         if !argHas(a2, "--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix") {
-                t.Fatal("sandbox 模式仍需挂载 /tmp/.X11-unix")
+                t.Fatal("tmpfs 模式仍需挂载 /tmp/.X11-unix")
         }
 }

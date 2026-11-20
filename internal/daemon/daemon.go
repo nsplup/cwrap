@@ -147,24 +147,6 @@ func devNullFD() int {
         return int(f.Fd())
 }
 
-// sanitizeName 把应用名清洗成安全的目录名成分。
-func sanitizeName(name string) string {
-        if name == "" {
-                return "app"
-        }
-        var b strings.Builder
-        for _, r := range name {
-                switch {
-                case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
-                        r == '.', r == '_', r == '-':
-                        b.WriteRune(r)
-                default:
-                        b.WriteByte('_')
-                }
-        }
-        return b.String()
-}
-
 func ipcSocket() string {
         p, _ := ipc.SocketPath()
         return p
@@ -237,24 +219,12 @@ func (s *Server) shutdown() {
         }())
 }
 
-// cleanStale 清扫 pid 已死的陈旧运行目录（连带其私有 /tmp 目录）。
+// cleanStale 清扫 pid 已死的陈旧运行目录。
 func cleanStale() {
         base := filepath.Join(runtimeDir(), "cwrap")
         entries, err := os.ReadDir(base)
         if err != nil {
                 return
-        }
-        removeStale := func(d string) {
-                // 运行目录内的 .tmpdir 记录 sandbox 模式私有 tmp 目录的位置，
-                // daemon 崩溃后由下次启动清扫，避免 /tmp 泄漏
-                if data, rerr := os.ReadFile(filepath.Join(d, ".tmpdir")); rerr == nil {
-                        td := strings.TrimSpace(string(data))
-                        if td != "" && strings.Contains(filepath.Base(filepath.Dir(td)), ".cwrap-tmpdir-") {
-                                os.RemoveAll(td)
-                                os.Remove(filepath.Dir(td)) // 仅当空时成功
-                        }
-                }
-                os.RemoveAll(d)
         }
         for _, e := range entries {
                 if !e.IsDir() || e.Name() == "cwrapd.sock" {
@@ -264,16 +234,16 @@ func cleanStale() {
                 pidFile := filepath.Join(dir, ".pid")
                 data, err := os.ReadFile(pidFile)
                 if err != nil {
-                        removeStale(dir)
+                        os.RemoveAll(dir)
                         continue
                 }
                 pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
                 if err != nil || pid <= 0 {
-                        removeStale(dir)
+                        os.RemoveAll(dir)
                         continue
                 }
                 if syscall.Kill(pid, 0) != nil {
-                        removeStale(dir)
+                        os.RemoveAll(dir)
                 }
         }
 }
@@ -365,8 +335,6 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 
         var sessionProxy, systemProxy *dbusproxy.Proxy
         var seccompFile *os.File
-        var tmpDir string
-        var tmpKind string
         cleanup := func() {
                 stopBoth(sessionProxy, systemProxy)
                 if seccompFile != nil {
@@ -374,13 +342,6 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
                         seccompFile = nil
                 }
                 os.RemoveAll(dir)
-                // sandbox 模式的私有 tmp 目录随运行结束清理（对齐 sas.sh
-                // SHARE_APP_TMPDIR=0 分支：退出即 rm -rf）；bind 模式是用户
-                // 自管路径，只删空上层不删用户数据。
-                if tmpDir != "" && tmpKind == "sandbox" {
-                        os.RemoveAll(tmpDir)
-                        os.Remove(filepath.Dir(tmpDir)) // 仅当空时成功
-                }
         }
         // 唯一清理出口：无论哪条路径返回（fail / 正常结束 / panic）都会执行。
         // cleanup 幂等（Stop 判空、RemoveAll 重复无害），注册越早覆盖越全。
@@ -390,36 +351,11 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
                 ipc.WriteJSON(uc, ipc.Response{Ok: false, Error: fmt.Sprintf(format, a...)})
         }
 
-        // /tmp 宿主侧准备：
-        //   sandbox -> $TMPDIR/.cwrap-tmpdir-<uid>/<app>-<id>，退出由 cleanup 删除
-        //   bind    -> 用户指定的目录（缺则创建，内容用户自管，不自动清理）
-        //   host/tmpfs -> 无需宿主侧目录
-        tmpSetting, terr := perm.ParseTmp(spec.Tmp)
-        if terr != nil {
+        // /tmp 处理（tmpfs | host）不涉及宿主侧目录准备，
+        // 仅校验参数合法性，非法值提前报错。
+        if _, terr := perm.ParseTmp(spec.Tmp); terr != nil {
                 fail("%v", terr)
                 return
-        }
-        tmpKind = tmpSetting.Kind
-        if tmpSetting.Kind == "sandbox" || tmpSetting.Kind == "bind" {
-                if tmpSetting.Kind == "bind" {
-                        tmpDir = tmpSetting.Path
-                } else {
-                        base := tmpSetting.Base
-                        if base == "" {
-                                base = os.TempDir() // 对齐 sas.sh：优先 $TMPDIR
-                        }
-                        tmpDir = filepath.Join(base,
-                                fmt.Sprintf(".cwrap-tmpdir-%d", syscall.Getuid()),
-                                sanitizeName(spec.App)+"-"+id)
-                }
-                if mkerr := os.MkdirAll(tmpDir, 0o700); mkerr != nil {
-                        fail("创建私有 tmp 目录 %s: %v", tmpDir, mkerr)
-                        return
-                }
-                // 标记文件：daemon 崩溃后由 cleanStale 连带清扫私有 tmp 目录
-                if tmpSetting.Kind == "sandbox" {
-                        os.WriteFile(filepath.Join(dir, ".tmpdir"), []byte(tmpDir), 0o600)
-                }
         }
 
         logw, err := os.OpenFile(filepath.Join(dir, "proxy.log"), os.O_CREATE|os.O_WRONLY, 0o600)
@@ -479,7 +415,6 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
                 UID:             uid,
                 HomeDir:         spec.HomeDirHost(),
                 SeccompFD:       seccompFD,
-                TmpDir:          tmpDir,
                 DBusSessionPath: proxyPath(sessionProxy, filepath.Join(dir, "session")),
                 DBusSystemPath:  proxyPath(systemProxy, filepath.Join(dir, "system")),
                 CmdPath:         req.Argv[0],

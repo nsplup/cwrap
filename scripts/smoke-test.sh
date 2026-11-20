@@ -80,21 +80,20 @@ sleep 1
 left=$(ls "$XDG_RUNTIME_DIR/cwrap" 2>/dev/null | rg -v 'cwrapd.sock|cwrapd.log' | wc -l)
 [ "$left" = 0 ] && ok "temp cleanup" || bad "temp cleanup (left=$left)"
 
-# 12. --tmp 三档 dry-run（参数拼装）
+# 12. --tmp 两档 dry-run（参数拼装）与非法值报错
 t "dry-run tmp tmpfs" 0 "$CWRAP" run --app demo --tmp tmpfs --dry-run -- /bin/echo hi
 t "dry-run tmp host" 0 "$CWRAP" run --app demo --tmp host --dry-run -- /bin/echo hi
-t "dry-run tmp bind" 0 "$CWRAP" run --app demo --tmp /tmp --dry-run -- /bin/echo hi
-t "dry-run tmp sandbox:BASE" 0 "$CWRAP" run --app demo --tmp sandbox:/var/tmp --dry-run -- /bin/echo hi
+t "invalid tmp rejected (sandbox)" 2 "$CWRAP" run --app demo --tmp sandbox --dry-run -- /bin/echo hi
+t "invalid tmp rejected (path)" 2 "$CWRAP" run --app demo --tmp /var/tmp --dry-run -- /bin/echo hi
 
 # 13. --fs 与 --tmp 冲突过滤警告
 "$CWRAP" run --app demo --tmp host --fs ro:/tmp/sub --dry-run -- /bin/true >/tmp/cwrap-smoke.out 2>&1
 grep -q "已被忽略" /tmp/cwrap-smoke.out && ok "fs/tmp conflict warning" || bad "fs/tmp conflict warning"
 
-# 14. sandbox 私有 /tmp 目录退出后被 daemon 清理（默认模式）
-"$CWRAP" run --app demo "${SEC_OFF[@]}" -- /bin/true >/dev/null 2>&1
-sleep 1
-left2=$(ls -d /tmp/.cwrap-tmpdir-*/ 2>/dev/null | wc -l)
-[ "$left2" = 0 ] && ok "sandbox tmpdir cleanup" || bad "sandbox tmpdir cleanup (left=$left2)"
+# 14. 无 --app 可运行（省略应用名时 HOME 默认 $HOME/.var/sandbox/home）
+rm -rf "$HOME/.var/sandbox/home"
+t "run without --app" 0 "$CWRAP" run --no-global "${SEC_OFF[@]}" -- /bin/echo no-app
+[ -d "$HOME/.var/sandbox/home" ] && ok "no-app home dir created" || bad "no-app home dir created"
 
 echo "-----"
 echo "pass=$pass fail=$fail"

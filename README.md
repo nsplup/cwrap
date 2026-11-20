@@ -67,12 +67,12 @@ cwrap run --app demo --share network --persist -- /usr/bin/myapp
 
 ## 配置文件
 
-全局 `~/.config/cwrap/cwrap.toml`、应用 `~/.config/cwrap/apps/<app>.toml`：
+全局 `~/.config/cwrap/global.toml`、应用 `~/.config/cwrap/apps/<app>.toml`：
 
 ```toml
 app = "demo"
 seccomp = "medium"          # low | medium | high
-tmp = "sandbox"             # sandbox(默认) | sandbox:BASE | tmpfs | host | "/绝对路径"
+tmp = "tmpfs"               # tmpfs(默认，全空) | host(宿主 /tmp)
 share = ["network"]
 socket = ["x11", "wayland"]
 device = []
@@ -87,7 +87,8 @@ env = ["MYAPP_DEBUG=1"]
 # home = "/srv/sandbox/demo"   # 自定义隔离目录
 ```
 
-优先级：全局 < 应用 < 命令行 FLAG（非空字段逐项覆盖）。
+优先级：全局 < 应用 < 命令行 FLAG。
+标量字段逐级覆盖；列表字段累加并去除完全重复的值；`--no-global` 可跳过全局配置。
 
 ## 架构
 

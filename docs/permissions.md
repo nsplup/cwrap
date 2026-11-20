@@ -4,22 +4,26 @@ cwrap 的权限语义对齐 Flatpak，但表达更直白：**默认零权限**�
 通过 FLAG 或 TOML 配置显式授予。配置加载顺序：
 
 ```
-~/.config/cwrap/cwrap.toml（全局默认）
+~/.config/cwrap/global.toml（全局默认）
   < ~/.config/cwrap/apps/<APP>.toml（应用配置）
-    < 命令行 FLAG（逐项覆盖）
+    < 命令行 FLAG（逐项合并）
 ```
+
+合并规则：标量字段（app/home/seccomp/tmp）非空覆盖；列表字段（share/socket/
+device/allow/fs/dbus/env/allow_syscalls）累加并去除完全重复的值。
+`--no-global` 可跳过全局配置的合并。
 
 ## 权限一览
 
 | 权限域 | FLAG | 取值 | 说明 |
 |---|---|---|---|
-| 应用标识 | `--app NAME` | 任意名称 | 决定 HOME 目录与配置文件，必需 |
+| 应用标识 | `--app NAME` | 任意名称 | 决定 HOME 目录与配置文件，可省略（省略时 HOME 默认 `$HOME/.var/sandbox/home`） |
 | HOME | `--home PATH` | 绝对路径 | 覆盖默认 `$HOME/.var/sandbox/<APP>` |
 | 共享 | `--share` | `network` `ipc` | network 同时放开 /etc/resolv.conf 读取 |
 | socket | `--socket` | `x11` `wayland` `pulseaudio` `pipewire` `cups` `pcsc` `ssh-agent` | 只读挂载对应 socket |
 | 设备 | `--device` | `dri` `kvm` `all` | 默认仅有 null/zero/urandom/tty 等最小 /dev |
 | 文件系统 | `--fs SPEC` | `rw:PATH` `ro:PATH` | PATH 支持绝对路径与 flatpak 关键字（见下节） |
-| /tmp | `--tmp MODE` | `sandbox`（默认） `sandbox:BASE` `tmpfs` `host` `/path` | 见下节 |
+| /tmp | `--tmp MODE` | `tmpfs`（默认） `host` | 见下节 |
 | 特性 | `--allow` | `devel` `multiarch` | devel 放行调试所需 seccomp 权限 |
 | D-Bus | `--dbus SPEC` | `session.talk=N` `session.own=N` `system.talk=N` `system.own=N` | 默认零放行 |
 | seccomp | `--seccomp LEVEL` | `low` `medium` `high` | 见下节 |
@@ -53,15 +57,12 @@ PATH 支持以下 Flatpak 风格关键字（展开为宿主真实路径后按 `r
 
 | 取值 | 行为 |
 |---|---|
-| `sandbox`（默认） | daemon 在宿主创建私有目录 `$TMPDIR/.cwrap-tmpdir-<uid>/<app>-<id>`，bind 为沙箱 `/tmp`；**退出后由 daemon 清理**（对齐 sas.sh `SHARE_APP_TMPDIR=0` 分支语义） |
-| `sandbox:BASE` | 同上，但私有目录放在 `BASE`（绝对路径）下，同样自动清理 |
-| `tmpfs` | 全空 `--tmpfs /tmp` |
+| `tmpfs`（默认） | 全空 `--tmpfs /tmp` |
 | `host` | `--bind /tmp /tmp` 完整访问宿主 /tmp |
-| `/some/path` | 把宿主 `/some/path` bind 为沙箱 `/tmp`（用户自管，不自动清理） |
 
 **与 --fs 的去重**：`--tmp` 已接管 `/tmp` 后，`--fs` 中指向 `/tmp` 本身的授权项
 会被过滤并警告；`tmp=host` 时 `/tmp` 子路径同样被过滤（宿主 `/tmp` 已整体可见，
-ro 收窄失效）。警告会引导改用 `--tmp` 的自定义路径形式。`socket=x11` 的
+ro 收窄失效）。警告会引导改用 `--tmp host`。`socket=x11` 的
 `/tmp/.X11-unix` 挂载在 `tmp=host` 时跳过（已随 `/tmp` 可见，代价是该 socket
 随 `/tmp` 变为可写，与 Flatpak 行为一致）。
 

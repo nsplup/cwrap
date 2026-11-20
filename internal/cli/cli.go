@@ -74,7 +74,8 @@ func usage() {
   cwrap version
 
 run 权限 FLAG（默认全部拒绝，需要什么给什么）:
-  --app NAME                    应用名（决定 HOME 与配置文件）
+  --app NAME                    应用名（可省略；决定 HOME 与配置文件，
+                                省略时 HOME 默认 $HOME/.var/sandbox/home）
   --home PATH                   自定义沙箱 HOME（默认 $HOME/.var/sandbox/NAME）
   --share LIST                  network, ipc
   --socket LIST                 x11, wayland, pulseaudio, pipewire, cups, pcsc, ssh-agent
@@ -86,13 +87,12 @@ run 权限 FLAG（默认全部拒绝，需要什么给什么）:
                                 尾缀 ? 表示目标不存在不报错
   --dbus SPEC                   session.talk=NAME / session.own=NAME /
                                 system.talk=NAME / system.own=NAME（可多次）
-  --tmp MODE                    /tmp 处理: sandbox（默认，私有目录，退出清理）/
-                                sandbox:BASE / tmpfs（全空）/ host（宿主 /tmp）/
-                                /绝对路径（bind 用户目录为 /tmp）
+  --tmp MODE                    /tmp 处理: tmpfs（默认，全空）/ host（宿主 /tmp）
   --seccomp LEVEL               low（宽松黑名单）/ medium（flatpak 级，默认）/
                                 high（默认拒绝+白名单，含 W^X 保护，最严格）
   --allow-syscall LIST          追加白名单 syscall（与等级叠加）
   --env KEY=VALUE               注入环境变量（可多次）
+  --no-global                   跳过全局配置合并（~/.config/cwrap/global.toml）
   --persist                     将本次合并后的授权保存为应用配置
   --dry-run                     只打印 bwrap 命令行，不实际运行
 

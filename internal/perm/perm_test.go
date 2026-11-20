@@ -76,24 +76,24 @@ func TestFSPathValidRejects(t *testing.T) {
 }
 
 func TestParseTmp(t *testing.T) {
-        for _, ok := range []string{"", "sandbox", "tmpfs", "host", "sandbox:/var/tmp", "/opt/data"} {
+        for _, ok := range []string{"", "tmpfs", "host"} {
                 if _, err := ParseTmp(ok); err != nil {
                         t.Fatalf("%q 应合法: %v", ok, err)
                 }
         }
-        for _, bad := range []string{"sandbox:relative", "wrong", "bind:/x"} {
+        for _, bad := range []string{"sandbox", "sandbox:/var/tmp", "sandbox:relative", "/opt/data", "/tmp", "wrong", "bind:/x"} {
                 if _, err := ParseTmp(bad); err == nil {
                         t.Fatalf("%q 应拒绝", bad)
                 }
         }
-        ts, err := ParseTmp("/opt/data")
-        if err != nil || ts.Kind != "bind" || ts.Path != "/opt/data" {
-                t.Fatalf("bind 解析异常: %+v %v", ts, err)
+        ts, err := ParseTmp("")
+        if err != nil || ts.Kind != "tmpfs" {
+                t.Fatalf("空值默认应为 tmpfs: %+v %v", ts, err)
         }
 }
 
 func TestFilterTmpFSConflicts(t *testing.T) {
-        // sandbox 默认：/tmp 本身冲突，/tmp 子路径保留
+        // tmpfs 默认：/tmp 本身冲突，/tmp 子路径保留
         p := Default()
         p.FS = []string{"rw:/tmp", "ro:/tmp/sub", "rw:/opt"}
         fs, warns := FilterTmpFSConflicts(p)
@@ -124,14 +124,41 @@ func TestFilterTmpFSConflicts(t *testing.T) {
         if len(fs3) != 1 {
                 t.Fatalf("tmpfs 不应过滤子路径: %v", fs3)
         }
+}
 
-        // bind 自定义为宿主 /tmp：等同 host
-        p4 := Default()
-        p4.Tmp = "/tmp"
-        p4.FS = []string{"ro:/tmp/x"}
-        fs4, warns4 := FilterTmpFSConflicts(p4)
-        if len(fs4) != 0 || len(warns4) != 1 {
-                t.Fatalf("bind:/tmp 应过滤子路径: %v %v", fs4, warns4)
+func TestOverlayList(t *testing.T) {
+        // 累加并去重：仅去除完全重复的值，保持顺序
+        got := OverlayList([]string{"network", "ipc"}, []string{"ipc", "network"})
+        want := []string{"network", "ipc"}
+        if strings.Join(got, ",") != strings.Join(want, ",") {
+                t.Fatalf("OverlayList 结果异常: %v want %v", got, want)
+        }
+
+        // 新值追加在后
+        got = OverlayList([]string{"network"}, []string{"ipc", "ipc"})
+        if strings.Join(got, ",") != "network,ipc" {
+                t.Fatalf("OverlayList 追加异常: %v", got)
+        }
+
+        // 空覆盖：仅对 base 去重
+        got = OverlayList([]string{"a", "a", "b"}, nil)
+        if strings.Join(got, ",") != "a,b" {
+                t.Fatalf("OverlayList 空覆盖异常: %v", got)
+        }
+}
+
+func TestHomeDirHostFallback(t *testing.T) {
+        // 无应用名时 HOME 默认 $HOME/.var/sandbox/home
+        p := Default()
+        p.App = ""
+        home := p.HomeDirHost()
+        if !strings.HasSuffix(home, "/.var/sandbox/home") {
+                t.Fatalf("无应用名时 HOME 应为 $HOME/.var/sandbox/home: %s", home)
+        }
+        p.App = "demo"
+        home = p.HomeDirHost()
+        if !strings.HasSuffix(home, "/.var/sandbox/demo") {
+                t.Fatalf("有应用名时 HOME 应为 $HOME/.var/sandbox/demo: %s", home)
         }
 }
 

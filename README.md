@@ -46,6 +46,28 @@ cwrap run --app demo --fs ro:xdg-download? --fs rw:~/project -- /usr/bin/myapp
 
 # 把本次授权固化为 demo 的配置文件
 cwrap run --app demo --share network --persist -- /usr/bin/myapp
+
+# 对齐扩展（Flatpak / bubblejail 语义，详见 docs/permissions.md）
+# 权限否决（对齐 flatpak override）：应用配置给了 x11，CLI 层撤销
+cwrap run --app demo --no-socket x11 -- /usr/bin/myapp
+
+# D-Bus 预设（bubblejail notify/systray/gamemode/mpris 服务）
+cwrap run --app demo --dbus preset:notify --dbus preset:mpris='firefox.*' -- /usr/bin/myapp
+
+# portal 权限包（伪 .flatpak-info + GTK_USE_PORTAL + xdg-open 覆盖）
+cwrap run --app demo --allow portal -- /usr/bin/myapp
+
+# 手柄 / 摄像头 / Wine ntsync（bubblejail joystick/v4l/ntsync 服务）
+cwrap run --app demo --device input,v4l,ntsync -- /usr/bin/game
+
+# 独立用户态网络栈（bubblejail pasta_network/slirp4netns 服务）
+cwrap run --app demo --net-backend pasta -- /usr/bin/myapp
+
+# 加固：递归封死沙箱内建 namespace + 屏蔽落盘 syscall
+cwrap run --app demo --harden namespaces,sync -- /usr/bin/myapp
+
+# 未过滤总线直通逃生门（对齐 flatpak --socket=session-bus，谨慎）
+cwrap run --app demo --socket session-bus -- /usr/bin/myapp
 ```
 
 ## 命令
@@ -76,15 +98,20 @@ tmp = "tmpfs"               # tmpfs(默认，全空) | host(宿主 /tmp)
 share = ["network"]
 socket = ["x11", "wayland"]
 device = []
-allow = []
+allow = []               # devel, multiarch, portal
 fs = ["ro:/opt/data", "ro:xdg-download?"]   # 支持 flatpak 关键字，? = 不存在不报错
-dbus = [
+dbus = [                                  # 支持 preset: 预设
   "session.talk=org.freedesktop.Notifications",
   "session.own=org.example.Demo",
+  "preset:notify",
 ]
+harden = []               # namespaces, sync
+net_backend = ""          # host | pasta | slirp4netns
 allow_syscalls = []
 env = ["MYAPP_DEBUG=1"]
+unset_env = []
 # home = "/srv/sandbox/demo"   # 自定义隔离目录
+# 否决示例：socket = ["!x11"]  # 从最终授权中移除 x11
 ```
 
 优先级：全局 < 应用 < 命令行 FLAG。

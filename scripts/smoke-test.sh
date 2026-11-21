@@ -95,6 +95,42 @@ rm -rf "$HOME/.var/sandbox/home"
 t "run without --app" 0 "$CWRAP" run --no-global "${SEC_OFF[@]}" -- /bin/echo no-app
 [ -d "$HOME/.var/sandbox/home" ] && ok "no-app home dir created" || bad "no-app home dir created"
 
+# ---- 以下为权限对齐扩展（flatpak / bubblejail 对齐）的冒烟场景 ----
+
+# 15. 否决语义 dry-run：--no-socket 应使参数中不再出现 x11 socket 挂载
+"$CWRAP" run --app demo --socket x11 --no-socket x11 --dry-run -- /bin/true >/tmp/cwrap-smoke.out 2>&1
+grep -q -- "--ro-bind-try /tmp/.X11-unix" /tmp/cwrap-smoke.out && bad "deny removes x11" || ok "deny removes x11"
+
+# 16. TOML "!" 否决与 --no-* 等价（FLAG 层验证）
+t "deny syntax accepted" 0 "$CWRAP" run --app demo --socket '!wayland' --dry-run -- /bin/true
+
+# 17. session-bus 直通：无宿主总线时仍允许拼参（直通不启动代理）
+t "dry-run session-bus passthrough" 0 "$CWRAP" run --app demo --socket session-bus --dry-run -- /bin/true
+
+# 18. gpg-agent / 新设备值 / preset / portal / harden / net-backend 拼参
+t "dry-run gpg-agent" 0 "$CWRAP" run --app demo --socket gpg-agent --dry-run -- /bin/true
+t "dry-run device ntsync" 0 "$CWRAP" run --app demo --device ntsync --dry-run -- /bin/true
+t "dry-run dbus preset" 0 "$CWRAP" run --app demo --dbus preset:notify --dry-run -- /bin/true
+t "dry-run mpris preset" 0 "$CWRAP" run --app demo --dbus 'preset:mpris=firefox.*' --dry-run -- /bin/true
+t "dry-run portal package" 0 "$CWRAP" run --app demo --allow portal --dry-run -- /bin/true
+t "dry-run harden namespaces" 0 "$CWRAP" run --app demo --harden namespaces --dry-run -- /bin/true
+t "dry-run harden sync" 0 "$CWRAP" run --app demo --harden sync --dry-run -- /bin/true
+t "dry-run net-backend pasta" 0 "$CWRAP" run --app demo --net-backend pasta --dry-run -- /bin/true
+t "invalid net-backend rejected" 2 "$CWRAP" run --app demo --net-backend vpn --dry-run -- /bin/true
+t "invalid harden rejected" 2 "$CWRAP" run --app demo --harden cheat --dry-run -- /bin/true
+
+# 19. --unset-env / --bwrap-arg / --dbus-arg 拼参
+t "dry-run unset-env" 0 "$CWRAP" run --app demo --unset-env LANG --dry-run -- /bin/true
+t "dry-run bwrap-arg" 0 "$CWRAP" run --app demo --bwrap-arg --cap-drop --bwrap-arg ALL --dry-run -- /bin/true
+
+# 20. harden namespaces 实际运行（pid1 写零 namespace 限额后 exec）
+if [ -n "${SEC_OFF[0]:-}" ]; then SECN=(--seccomp off); else SECN=(); fi
+t "harden namespaces run" 0 "$CWRAP" run --app demo "${SECN[@]}" --harden namespaces -- /bin/echo hardened
+
+# 21. portal 包实际运行：沙箱内应能看到 /.flatpak-info
+"$CWRAP" run --app demo "${SECN[@]}" --allow portal -- /bin/sh -c 'test -f /.flatpak-info' >/dev/null 2>&1
+[ $? = 0 ] && ok "portal flatpak-info visible" || bad "portal flatpak-info visible"
+
 echo "-----"
 echo "pass=$pass fail=$fail"
 [ "$fail" = 0 ]

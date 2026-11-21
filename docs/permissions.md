@@ -1,7 +1,9 @@
-# cwrap 权限模型手册
+# cwrap 权限模型手册（Flatpak / bubblejail 对齐版）
 
-cwrap 的权限语义对齐 Flatpak，但表达更直白：**默认零权限**，任何能力都必须
-通过 FLAG 或 TOML 配置显式授予。配置加载顺序：
+cwrap 的权限语义对齐 Flatpak 与 bubblejail，表达更直白：**默认零权限**，
+任何能力都必须通过 FLAG 或 TOML 配置显式授予。
+
+配置加载顺序：
 
 ```
 ~/.config/cwrap/global.toml（全局默认）
@@ -9,98 +11,115 @@ cwrap 的权限语义对齐 Flatpak，但表达更直白：**默认零权限**�
     < 命令行 FLAG（逐项合并）
 ```
 
-合并规则：标量字段（app/home/seccomp/tmp）非空覆盖；列表字段（share/socket/
-device/allow/fs/dbus/env/allow_syscalls）累加并去除完全重复的值。
-`--no-global` 可跳过全局配置的合并。
+合并规则：标量字段（app/home/seccomp/tmp/net_backend）非空覆盖；
+列表字段（share/socket/device/allow/fs/dbus/env/allow_syscalls/harden/
+net_backend_args/unset_env/raw_bwrap/raw_dbus）累加并去重。
 
-## 权限一览
+**否决语义**（对齐 `flatpak override --nosocket` 等）：任何列表项支持
+`!` 前缀（TOML 写 `"!x11"`），或使用 `--no-share/--no-socket/--no-device/
+--no-allow/--no-fs/--no-dbus/--no-env` FLAG。否决作用于最终合并结果：
+被否决的值从授权列表中整体移除，后层可撤销前层授予。
 
-| 权限域 | FLAG | 取值 | 说明 |
+## 权限三栏对照矩阵
+
+### 共享（share）
+
+| cwrap | Flatpak | bubblejail | 说明 |
 |---|---|---|---|
-| 应用标识 | `--app NAME` | 任意名称 | 决定 HOME 目录与配置文件，可省略（省略时 HOME 默认 `$HOME/.var/sandbox/home`） |
-| HOME | `--home PATH` | 绝对路径 | 覆盖默认 `$HOME/.var/sandbox/<APP>` |
-| 共享 | `--share` | `network` `ipc` | network 同时放开 /etc/resolv.conf 读取 |
-| socket | `--socket` | `x11` `wayland` `pulseaudio` `pipewire` `cups` `pcsc` `ssh-agent` | 只读挂载对应 socket |
-| 设备 | `--device` | `dri` `kvm` `all` | 默认仅有 null/zero/urandom/tty 等最小 /dev |
-| 文件系统 | `--fs SPEC` | `rw:PATH` `ro:PATH` | PATH 支持绝对路径与 flatpak 关键字（见下节） |
-| /tmp | `--tmp MODE` | `tmpfs`（默认） `host` | 见下节 |
-| 特性 | `--allow` | `devel` `multiarch` | devel 放行调试所需 seccomp 权限 |
-| D-Bus | `--dbus SPEC` | `session.talk=N` `session.own=N` `system.talk=N` `system.own=N` | 默认零放行 |
-| seccomp | `--seccomp LEVEL` | `low` `medium` `high` | 见下节 |
-| syscall | `--allow-syscall` | syscall 名 | 向任意等级追加白名单 |
-| 环境 | `--env K=V` | 任意 | 注入环境变量 |
+| `network` | `--share=network` | `network` 服务 | 含 resolv.conf 断链修复（systemd-resolved symlink 场景补挂 `/run/systemd/resolve`） |
+| `ipc` | `--share=ipc` | （默认隔离） | 不授予则 `--unshare-ipc` |
+| `--net-backend pasta` | 无 | `pasta_network` 服务 | 独立用户态网络栈；bwrap 侧 `--unshare-net` + `--info-fd` 取 PID 后由 cwrapd 挂接 |
+| `--net-backend slirp4netns` | 无 | `slirp4netns` 服务 | 同上；DNS 注入 `10.0.2.3`（`--ro-bind-data` 覆盖 resolv.conf） |
 
-环境变量默认全部擦除，仅保留：`PATH`、`TERM`、`LANG`、`HOME`、`USER`、
-`LOGNAME`、`XDG_RUNTIME_DIR`；`DISPLAY` 仅在授予 `socket=x11` 时注入，
-`WAYLAND_DISPLAY` 仅在授予 `socket=wayland` 时注入，以此类推。
+### socket
 
-## 文件系统授权（--fs）
+| cwrap | Flatpak | bubblejail | bwrap 生成 |
+|---|---|---|---|
+| `x11` | `--socket=x11` | `x11` 服务 | `DISPLAY` 透传 + `--ro-bind-try /tmp/.X11-unix`；`XAUTHORITY` 挂到 `/tmp/.Xauthority` 并改写环境变量（写路径隔离）；Wayland 会话下 `XDG_SESSION_TYPE=x11` |
+| `wayland` | `--socket=wayland` | `wayland` 服务 | 宿主任意名 socket → 统一挂为 `wayland-0`；`GDK_BACKEND/QT_QPA_PLATFORM/SDL_VIDEODRIVER/XDG_SESSION_TYPE=wayland` |
+| `pulseaudio` | `--socket=pulseaudio` | `pulse_audio` 服务 | **仅 bind native socket**：`--bind-try <rt>/pulse/native`（rw）+ `PULSE_SERVER` |
+| `pipewire` | `--socket=pipewire` | `pipewire` 服务 | `--ro-bind-try <rt>/pipewire-0` |
+| `cups` | `--socket=cups` | 无 | `--ro-bind-try <rt>/cups` |
+| `pcsc` | `--socket=pcsc` | 无 | `--ro-bind-try /run/pcscd` |
+| `ssh-agent` | `--socket=ssh-agent` | 无 | `--ro-bind-try <rt>/ssh-auth`（`SSH_AUTH_SOCK` 改写） |
+| `gpg-agent` | `--socket=gpg-agent` | 无 | `--ro-bind-try ~/.gnupg` + `--bind-try <rt>/gnupg` |
+| `session-bus` | `--socket=session-bus` | （默认无） | **未过滤直通**：`--bind-try <rt>/bus`，不启动代理，打印警告 |
+| `system-bus` | `--socket=system-bus` | （默认无） | `--ro-bind-try /run/dbus/system_bus_socket`，不启动代理 |
 
-PATH 支持以下 Flatpak 风格关键字（展开为宿主真实路径后按 `ro:`/`rw:` 挂载）：
+### D-Bus（dbus）
 
-| 关键字 | 展开为 |
-|---|---|
-| `home`、`~`、`~/sub` | 用户 HOME（`$HOME`） |
-| `host` | 宿主全部一级目录；自动跳过 `/proc` `/sys` `/dev` `/usr` `/etc` `/run`（基线已处理）与 `/tmp`（由 `--tmp` 管辖） |
-| `host-os` | `/usr` |
-| `host-etc` | `/etc` |
-| `xdg-config[/sub]` | `$XDG_CONFIG_HOME`（默认 `$HOME/.config`） |
-| `xdg-data[/sub]` | `$XDG_DATA_HOME`（默认 `$HOME/.local/share`） |
-| `xdg-cache[/sub]` | `$XDG_CACHE_HOME`（默认 `$HOME/.cache`） |
-| `xdg-run[/sub]` | `$XDG_RUNTIME_DIR`（默认 `/run/user/<uid>`） |
-| `xdg-desktop` `xdg-documents` `xdg-download` `xdg-music` `xdg-pictures` `xdg-public-share` `xdg-templates` `xdg-videos` | XDG 用户目录，按 `user-dirs.dirs` 解析（兼容中文目录名），未配置回退 `$HOME/<英文>` |
+| cwrap | Flatpak | bubblejail | 说明 |
+|---|---|---|---|
+| `session.talk=NAME` 等 | `--talk-name/--own-name` | 对应服务规则 | 经 xdg-dbus-proxy `--filter`（默认零放行） |
+| `session.see=NAME` | （内部） | DbusSessionSee | `--see=NAME` |
+| `session.call=NAME=iface.glob@path` | （内部） | DbusSessionCall | `--call=...` |
+| `session.broadcast=...` | （内部） | DbusSessionBroadcast | `--broadcast=...` |
+| `preset:notify` | portal Notification | `notify` 服务 | talk + call org.freedesktop.Notifications |
+| `preset:systray` | 无 | `systray` 服务 | org.kde.StatusNotifierWatcher |
+| `preset:gamemode` | 无 | `gamemode` 服务 | com.feralinteractive.GameMode |
+| `preset:mpris=GLOB` | `--own-name` | `mpris` 服务 | `--own=org.mpris.MediaPlayer2.<GLOB>` |
+| `preset:portal` | （默认可见） | `xdg_desktop_portal` 基座 | talk Desktop + Properties/Request/Session 调用规则 |
+| `preset:gnome-toolkit` | 无 | `gnome_toolkit` 服务 | portal.*/dconf/gtk.vfs |
+| `preset:ibus` / `preset:fcitx` | 输入法 portal | `ibus`/`fcitx` 服务 | talk 规则 + IM 环境变量（GTK/QT_IM_MODULE 等） |
+| `--dbus-arg ARG` | 无 | `debug` 服务 raw_dbus_args | 原样透传 xdg-dbus-proxy |
+| `--allow portal` | portal 体验 | `xdg_desktop_portal` 完整包 | memfd 伪 `/.flatpak-info`（`--ro-bind-data`）+ `GTK_USE_PORTAL=1` + 自动注入 `preset:portal` + flatpak-xdg-utils 的 xdg-open 覆盖（存在时） |
 
-尾缀 `?`（如 `ro:~/project?`）表示目标不存在时不报错（使用 `--bind-try`）。
-裸 `/` 仍被禁止（完整宿主请用关键字 `host` 逐级授予）。
+### 设备（device）
 
-## /tmp 处理（--tmp）
+| cwrap | Flatpak | bubblejail | bwrap 生成 |
+|---|---|---|---|
+| `dri` | `--device=dri` | `direct_rendering` 服务 | `--dev-bind /dev/dri` + sysfs + **NVIDIA**：`/dev/nvidia*`、`/sys/module/nvidia*`；`/sys/class/drm` 逐条 symlink 重建 |
+| `kvm` | `--device=kvm` | 无 | `--dev-bind-try /dev/kvm` |
+| `all` | `--device=all` | 无 | `--dev-bind /dev`（整棵 devtmpfs，谨慎） |
+| `input` | 无 | `joystick` 服务 | `/dev/input/js*`、`event*` + `/sys/class/input` symlink 重建 |
+| `v4l` | `--device=all`（子集） | `v4l` 服务 | `/dev/video*`、`/dev/media*` + video4linux/media sysfs |
+| `ntsync` | 无 | `ntsync` 服务 | `--dev-bind-try /dev/ntsync` |
 
-| 取值 | 行为 |
-|---|---|
-| `tmpfs`（默认） | 全空 `--tmpfs /tmp` |
-| `host` | `--bind /tmp /tmp` 完整访问宿主 /tmp |
+### 文件系统（fs）
 
-**与 --fs 的去重**：`--tmp` 已接管 `/tmp` 后，`--fs` 中指向 `/tmp` 本身的授权项
-会被过滤并警告；`tmp=host` 时 `/tmp` 子路径同样被过滤（宿主 `/tmp` 已整体可见，
-ro 收窄失效）。警告会引导改用 `--tmp host`。`socket=x11` 的
-`/tmp/.X11-unix` 挂载在 `tmp=host` 时跳过（已随 `/tmp` 可见，代价是该 socket
-随 `/tmp` 变为可写，与 Flatpak 行为一致）。
+`--fs` 完整支持 Flatpak 关键字：`home`/`~`/`~/sub`、`host`、`host-os`、
+`host-etc`、`xdg-config[/sub]`、`xdg-data[/sub]`、`xdg-cache[/sub]`、
+`xdg-run[/sub]`、`xdg-desktop/documents/download/music/pictures/
+public-share/templates/videos`；尾缀 `?` 表示目标不存在不报错
+（对应 bubblejail `home_share`/`root_share` 的 `home_paths[_read_only]`）。
+`--tmp tmpfs|host` 管辖 /tmp（对齐 bubblejail 的沙箱 tmpfs 语义）。
 
-## seccomp 等级
+### 加固与调试（harden / raw）
 
-严格度递增，默认 `medium`：
-
-| 等级 | 机制 | 内容 |
+| cwrap | 基准 | 说明 |
 |---|---|---|
-| `low` | 黑名单（最小集） | bpf、kexec_load、kexec_file_load、init_module、finit_module、delete_module、swapon、swapoff、reboot、acct |
-| `medium` | 黑名单（flatpak 默认级） | low 全部 + ptrace、process_vm_readv/writev、keyctl、add_key、request_key、perf_event_open、setns、fanotify_init/mark、lookup_dcookie、open_by_handle_at、name_to_handle_at、clock_settime、settimeofday、adjtimex、iopl、ioperm、unshare、pivot_root、uselib |
-| `high` | 默认拒绝 + 白名单 | 仅放行常规用户态集合（文件/进程/内存/网络/IPC/时钟），**附 W^X 保护** |
+| `--harden namespaces` | bubblejail `namespaces_limits` | 沙箱 pid1（sh 包装器）写零 `/proc/sys/user/max_*_namespaces` 后 exec；pid1 保留 userns 内 caps（放弃 `--cap-drop ALL`） |
+| `--harden sync` | bubblejail `filter_disk_sync` | `sync/fsync/fdatasync/syncfs/sync_file_range/msync` → 返回 0（假装成功） |
+| `--bwrap-arg` | bubblejail `debug.raw_bwrap_args` | 原样追加 bwrap 参数 |
+| `--dbus-arg` | bubblejail `debug.raw_dbus_args` | 原样追加 xdg-dbus-proxy 参数 |
+| `--unset-env` | Flatpak `--unset-env` | 与 `--clearenv` 叠加时为幂等兼容语义 |
 
-- **W^X 保护（仅 `high`）**：禁止创建同时具有 WRITE+EXEC 的内存映射
-  （mmap/mprotect/pkey_mprotect）；`low`/`medium` 黑名单模式不做该检查。
-- **`--allow devel`（对齐 Flatpak devel 语义）**：
-  - `medium`：从黑名单剔除调试所需的 `ptrace`、`perf_event_open`；
-  - `high`：白名单追加 `ptrace`、`perf_event_open`，并解除 W^X 检查。
-- `--allow-syscall NAME` 在任意等级上追加放行；与等级集合叠加生效。
-- BPF 程序由 cwrap 在内存中生成（纯 Go，无 libseccomp 依赖），经 memfd
-  以文件描述符传给 `bwrap --seccomp`，不落盘。
+## seccomp
 
-基线 bwrap 参数额外包含 `--cap-drop ALL`（沙箱内进程不保留任何 Linux capability）。
+- `low`：仅内核级高危黑名单（bpf/kexec/模块/swap/reboot 等）。
+- `medium`：flatpak 默认级黑名单（追加 ptrace 系、keyctl、userns 等）；
+  `--allow devel` 时剔除 ptrace/perf_event_open。
+- `high`：默认拒绝 + 白名单 + W^X 检查（`--allow devel` 解除）。
+- `--allow-syscall NAME` 任意档追加白名单；`--harden sync` 任意档追加
+  落盘调用屏蔽（返回 0）。
+- BPF 由纯 Go 生成，memfd 传递给 `bwrap --seccomp`，不落盘。
+
+基线 bwrap 参数额外包含 `--cap-drop ALL`（`--harden namespaces` 除外）。
 
 ## D-Bus
 
-- 未授予任何 `--dbus` 权限时**不启动代理**，沙箱内没有总线可用。
-- 授予后由 `xdg-dbus-proxy` 接管，`--filter` 生效且**默认零放行规则**，
-  只有显式给出的 talk/own 名字被加入白名单。
+- 未授予任何 `--dbus`/socket 总线权限时**不启动代理**，沙箱内没有总线。
+- 授予后由 `xdg-dbus-proxy` 接管，`--filter` 生效且默认零放行规则；
+  规则按 `session.`/`system.` 前缀分流到对应代理。
 - 代理 socket 写入 `$XDG_RUNTIME_DIR/cwrap/<时间戳>/session|system`，
-  运行结束后由 cwrapd 清理。
-- 沙箱内地址固定为 `unix:path=/run/cwrap/sessionBus|systemBus`。
+  结束后由 cwrapd 清理；沙箱内地址固定 `/run/cwrap/sessionBus|systemBus`。
 
-## 已知限制（与 Flatpak 一致或明示不做）
+## 已知限制
 
-- **X11 没有逐窗口权限**：授予 `socket=x11` 即等于信任该应用对 X 服务器的
-  全部操作；需要细粒度隔离请使用 Wayland。
-- 可执行文件自动挂载只做一层解析（脚本会连带其 shebang 解释器）；
-  若二进制动态链接了挂载范围之外的私有库，请用 `--fs ro:PATH` 手动补充。
-- `high` 级白名单目前按 amd64 构建生成；其他架构请使用 low/medium，
-  或自行通过 `--allow-syscall` 补充。
+- X11 没有逐窗口权限（与 Flatpak 一致）；细粒度隔离请用 Wayland。
+- `--socket session-bus/system-bus` 是**未过滤直通逃生门**（与 Flatpak
+  同名语义），授予即放弃 D-Bus 治理。
+- 可执行文件自动挂载只做一层解析（含 shebang 解释器）。
+- pasta/slirp4netns 需要宿主安装对应二进制（运行时检测）。
+- `high` 白名单按 amd64 构建；其他架构用 low/medium 或 `--allow-syscall`。
+- `--harden namespaces` 以放弃 pid1 的 `--cap-drop ALL` 为代价。

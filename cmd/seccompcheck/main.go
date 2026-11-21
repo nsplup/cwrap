@@ -22,16 +22,22 @@ type sockFprog struct {
 }
 
 func main() {
-	// 生成 dump: seccompcheck gen medium /tmp/prog.bpf
-	if len(os.Args) == 4 && os.Args[1] == "gen" {
-		prog, err := seccomp.Generate(os.Args[2], nil, false)
+	// 生成 dump: seccompcheck gen medium|high [--sync] /tmp/prog.bpf
+	if len(os.Args) >= 4 && os.Args[1] == "gen" {
+		syncBlock := false
+		rest := os.Args[2:]
+		if len(rest) == 3 && rest[1] == "--sync" {
+			syncBlock = true
+			rest = []string{rest[0], rest[2]}
+		}
+		prog, err := seccomp.Generate(rest[0], nil, false, syncBlock)
 		if err != nil {
 			panic(err)
 		}
-		if err := os.WriteFile(os.Args[3], prog, 0o644); err != nil {
+		if err := os.WriteFile(rest[1], prog, 0o644); err != nil {
 			panic(err)
 		}
-		fmt.Printf("已写入 %s（%d 字节，%d 条指令）\n", os.Args[3], len(prog), len(prog)/8)
+		fmt.Printf("已写入 %s（%d 字节，%d 条指令）\n", rest[1], len(prog), len(prog)/8)
 		return
 	}
 

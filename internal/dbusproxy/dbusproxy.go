@@ -1,7 +1,7 @@
 // Package dbusproxy 封装 xdg-dbus-proxy。
 //
-// 默认零放行：只有提供了显式的 talk/own 规则才会被加入白名单；
-// 未请求任何 D-Bus 权限时不启动代理。
+// 默认零放行：只有提供了显式的 talk/own/see/call/broadcast 规则才会被
+// 加入白名单；未请求任何 D-Bus 权限时不启动代理。
 // socket 文件统一写入 $XDG_RUNTIME_DIR/cwrap/<时间戳>/ 下。
 package dbusproxy
 
@@ -41,47 +41,105 @@ type Proxy struct {
 }
 
 // NeedBuses 根据权限判断需要代理哪些总线。
+// 直通逃生门（--socket session-bus/system-bus）不走代理，由 bwrap 直接挂载。
 func NeedBuses(p *perm.Permissions) (session, system bool) {
-	for _, d := range p.DBus {
-		switch {
-		case strings.HasPrefix(d, "session."):
-			session = true
-		case strings.HasPrefix(d, "system."):
-			system = true
+	tokens, _ := perm.ExpandDbusPresets(p.DBus) // 语法错误由 Validate 负责
+	if perm.Has(p.Socket, "session-bus") {
+		session = false // 直通：不启动代理
+	} else {
+		for _, d := range tokens {
+			if strings.HasPrefix(d, "session.") {
+				session = true
+			}
+		}
+	}
+	if perm.Has(p.Socket, "system-bus") {
+		system = false // 直通：不启动代理
+	} else {
+		for _, d := range tokens {
+			if strings.HasPrefix(d, "system.") {
+				system = true
+			}
 		}
 	}
 	return
 }
 
+// filterRules 按总线前缀过滤规则；"-" 开头的 token 为原样透传的
+// xdg-dbus-proxy 参数（--dbus-arg），始终保留。
+func filterRules(rules []string, bus string) []string {
+	var out []string
+	for _, r := range rules {
+		if strings.HasPrefix(r, "-") {
+			out = append(out, r)
+			continue
+		}
+		if strings.HasPrefix(r, bus+".") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// dbusProxyArgs 把 perm 层规则 token 翻译成 xdg-dbus-proxy 参数。
+// 支持目标：talk / own / see / call / broadcast（对齐 bubblejail 的
+// DbusSessionCall 等；call/broadcast 支持 NAME=iface.glob@path 语法）。
+// "-" 开头的 token 原样透传。
+func dbusProxyArgs(rules []string) ([]string, error) {
+	var args []string
+	for _, r := range rules {
+		if strings.HasPrefix(r, "-") {
+			args = append(args, r)
+			continue
+		}
+		tgt, name, ok := strings.Cut(r, "=")
+		if !ok || name == "" {
+			return nil, fmt.Errorf("非法 --dbus 规则 %q（应为 session.talk=NAME 等）", r)
+		}
+		verb := strings.TrimPrefix(tgt, "session.")
+		verb = strings.TrimPrefix(verb, "system.")
+		switch verb {
+		case "talk":
+			args = append(args, "--talk="+name)
+		case "own":
+			args = append(args, "--own="+name)
+		case "see":
+			args = append(args, "--see="+name)
+		case "call":
+			args = append(args, "--call="+name)
+		case "broadcast":
+			args = append(args, "--broadcast="+name)
+		default:
+			return nil, fmt.Errorf("无效的 --dbus 规则类型 %q", tgt)
+		}
+	}
+	return args, nil
+}
+
 // Start 启动代理并等待就绪。
 //
-// addr/socketPath 为总线地址与 socket 输出路径；readyFD 通过 ExtraFiles
-// 传入（固定为子进程 fd 3），代理就绪后向其写一个字节。
+// addr/socketPath 为总线地址与 socket 输出路径；rules 为 perm 层 token
+// （自动按总线前缀过滤）；readyFD 通过 ExtraFiles 传入（固定为子进程 fd 3），
+// 代理就绪后向其写一个字节。
 func Start(addr, socketPath string, rules []string, logw io.Writer) (*Proxy, error) {
+	bus := "session"
+	if strings.HasPrefix(filepath.Base(socketPath), "system") {
+		bus = "system"
+	}
+	expanded, perr := perm.ExpandDbusPresets(rules)
+	if perr != nil {
+		return nil, perr
+	}
+	mapped, err := dbusProxyArgs(filterRules(expanded, bus))
+	if err != nil {
+		return nil, err
+	}
 	readyR, readyW, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
 	args := []string{"--fd=3", addr, socketPath, "--filter"}
-	for _, r := range rules {
-		tgt, name, ok := strings.Cut(r, "=")
-		if !ok || name == "" {
-			readyR.Close()
-			readyW.Close()
-			return nil, fmt.Errorf("非法 --dbus 规则 %q（应为 session.talk=NAME 等）", r)
-		}
-		switch tgt {
-		case "session.talk", "system.talk":
-			args = append(args, "--talk="+name)
-		case "session.own", "system.own":
-			args = append(args, "--own="+name)
-		default:
-			readyR.Close()
-			readyW.Close()
-			return nil, fmt.Errorf("非法 --dbus 目标 %q（可用: %s）", tgt, strings.Join(perm.DBusTargets, ","))
-		}
-	}
-
+	args = append(args, mapped...)
 	cmd := exec.Command("xdg-dbus-proxy", args...)
 	cmd.ExtraFiles = []*os.File{readyW}
 	cmd.Stdout = logw

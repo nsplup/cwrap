@@ -117,6 +117,23 @@ unset_env = []
 优先级：全局 < 应用 < 命令行 FLAG。
 标量字段逐级覆盖；列表字段累加并去除完全重复的值；`--no-global` 可跳过全局配置。
 
+## 程序级配置（与权限配置分离）
+
+`~/.config/cwrap/config.toml` 用于指定外部工具的可执行路径，
+未配置时按 PATH 查找默认命令：
+
+```toml
+# cwrap 程序级配置（~/.config/cwrap/config.toml）
+bwrap_path = "/usr/local/bin/bwrap"           # 默认 "bwrap"
+xdg_dbus_proxy_path = "/opt/bin/xdg-dbus-proxy" # 默认 "xdg-dbus-proxy"
+```
+
+## 参数传递方式
+
+bwrap 与 xdg-dbus-proxy 的全部参数均经 **fd 传递**（`bwrap --args FD` /
+`xdg-dbus-proxy --args=FD`，bubblejail 同款方式）：命令行只保留 fd 编号，
+彻底规避 ARG_MAX 限制，参数也不会暴露在 `/proc/<pid>/cmdline` 中。
+
 ## 架构
 
 ```

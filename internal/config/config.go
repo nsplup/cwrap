@@ -37,6 +37,53 @@ func LoadGlobal() (*perm.Permissions, error) {
 	return loadFile(globalPath())
 }
 
+// Program 是 cwrap 程序级配置（区别于全局权限配置 global.toml），
+// 文件为 ~/.config/cwrap/config.toml，用于指定外部工具的可执行路径。
+type Program struct {
+	BwrapPath        string `toml:"bwrap_path,omitempty"`          // 默认 "bwrap"（按 PATH 查找）
+	XdgDBusProxyPath string `toml:"xdg_dbus_proxy_path,omitempty"` // 默认 "xdg-dbus-proxy"（按 PATH 查找）
+}
+
+// DefaultBwrapCmd / DefaultDBusProxyCmd 是未自定义时使用的命令名。
+const (
+	DefaultBwrapCmd     = "bwrap"
+	DefaultDBusProxyCmd = "xdg-dbus-proxy"
+)
+
+// BwrapCmd 返回实际使用的 bwrap 命令（未自定义时按 PATH 查找）。
+func (p Program) BwrapCmd() string {
+	if p.BwrapPath != "" {
+		return p.BwrapPath
+	}
+	return DefaultBwrapCmd
+}
+
+// DBusProxyCmd 返回实际使用的 xdg-dbus-proxy 命令。
+func (p Program) DBusProxyCmd() string {
+	if p.XdgDBusProxyPath != "" {
+		return p.XdgDBusProxyPath
+	}
+	return DefaultDBusProxyCmd
+}
+
+func programPath() string { return filepath.Join(Dir(), "config.toml") }
+
+// LoadProgram 读取程序级配置；文件不存在时返回空配置（全部使用默认命令）。
+func LoadProgram() (Program, error) {
+	var prog Program
+	data, err := os.ReadFile(programPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return prog, nil
+		}
+		return prog, fmt.Errorf("读取程序配置 %s: %w", programPath(), err)
+	}
+	if err := toml.Unmarshal(data, &prog); err != nil {
+		return prog, fmt.Errorf("解析程序配置 %s: %w", programPath(), err)
+	}
+	return prog, nil
+}
+
 // LoadApp 读取指定应用的配置；文件不存在时返回空配置。
 func LoadApp(name string) (*perm.Permissions, error) {
 	return loadFile(appPath(name))

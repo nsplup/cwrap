@@ -106,9 +106,11 @@ func Args(o *Options) ([]string, error) {
 	hostTmpExposed := ts.Kind == "host"
 
 	// /sys 基线（对齐 bubblejail 默认服务）：私有 /sys 目录 + CPU 信息只读
-	// （JIT/游戏/lscpu 等普遍依赖 /sys/devices/system/cpu）
+	// （JIT/游戏/lscpu 等普遍依赖 /sys/devices/system/cpu）。
+	// 注意：bwrap 的 --perms 必须紧跟 --dir/--tmpfs/--symlink 等"创建"类
+	// 选项，不能挂在 --ro-bind-try 前面（目标目录由 bwrap 自动创建）。
 	a = append(a, "--perms", "0700", "--dir", "/sys")
-	a = append(a, "--perms", "0755", "--ro-bind-try", "/sys/devices/system/cpu", "/sys/devices/system/cpu")
+	a = append(a, "--ro-bind-try", "/sys/devices/system/cpu", "/sys/devices/system/cpu")
 
 	// /dev
 	if perm.Has(p.Device, "all") {

@@ -14,6 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	"cwrap/internal/config"
 	"cwrap/internal/perm"
 )
 
@@ -118,10 +121,14 @@ func dbusProxyArgs(rules []string) ([]string, error) {
 
 // Start 启动代理并等待就绪。
 //
+// proxyPath 为 xdg-dbus-proxy 可执行路径（空串 = 按 PATH 查找）；
 // addr/socketPath 为总线地址与 socket 输出路径；rules 为 perm 层 token
-// （自动按总线前缀过滤）；readyFD 通过 ExtraFiles 传入（固定为子进程 fd 3），
-// 代理就绪后向其写一个字节。
-func Start(addr, socketPath string, rules []string, logw io.Writer) (*Proxy, error) {
+// （自动按总线前缀过滤）。readyFD 通过 ExtraFiles 传入（固定为子进程
+// fd 3），代理就绪后向其写一个字节。
+//
+// 全部位置参数与规则经 --args=4（fd 4）传递，命令行只保留 --fd=3 与
+// --args=4：彻底规避 ARG_MAX，参数也不再暴露在 /proc/<pid>/cmdline。
+func Start(proxyPath, addr, socketPath string, rules []string, logw io.Writer) (*Proxy, error) {
 	bus := "session"
 	if strings.HasPrefix(filepath.Base(socketPath), "system") {
 		bus = "system"
@@ -138,18 +145,29 @@ func Start(addr, socketPath string, rules []string, logw io.Writer) (*Proxy, err
 	if err != nil {
 		return nil, err
 	}
-	args := []string{"--fd=3", addr, socketPath, "--filter"}
-	args = append(args, mapped...)
-	cmd := exec.Command("xdg-dbus-proxy", args...)
-	cmd.ExtraFiles = []*os.File{readyW}
+	// fd 3 = ready 同步管道；fd 4 = 参数文件（--args=4）
+	argsContent := append([]string{addr, socketPath, "--filter"}, mapped...)
+	argsFile, err := memfdLines("cwrap-dbus-proxy-args", argsContent)
+	if err != nil {
+		readyR.Close()
+		readyW.Close()
+		return nil, err
+	}
+	if proxyPath == "" {
+		proxyPath = config.DefaultDBusProxyCmd
+	}
+	cmd := exec.Command(proxyPath, "--fd=3", "--args=4")
+	cmd.ExtraFiles = []*os.File{readyW, argsFile}
 	cmd.Stdout = logw
 	cmd.Stderr = logw
 	if err := cmd.Start(); err != nil {
 		readyR.Close()
 		readyW.Close()
-		return nil, fmt.Errorf("启动 xdg-dbus-proxy: %w", err)
+		argsFile.Close()
+		return nil, fmt.Errorf("启动 xdg-dbus-proxy（%s）: %w", proxyPath, err)
 	}
 	readyW.Close() // 父进程侧立刻关闭写端
+	argsFile.Close()
 
 	pr := &Proxy{cmd: cmd, ready: readyR}
 	// 等待就绪信号（带超时）
@@ -163,6 +181,31 @@ func Start(addr, socketPath string, rules []string, logw io.Writer) (*Proxy, err
 	// xdg-dbus-proxy 监视此 fd 的 HUP/ERR：对端关闭 = 立即 unlink socket 并退出。
 	// 读端必须由 daemon 持有到沙箱运行结束（见 Stop）。
 	return pr, nil
+}
+
+// memfdLines 把参数逐行写入 memfd 并回卷偏移（供 --args=FD 读取）。
+// 参数本身不含换行时每行恰好一个参数；cwrap 生成的参数（路径/总线名/
+// 规则）均不含换行。
+func memfdLines(name string, lines []string) (*os.File, error) {
+	fd, err := unix.MemfdCreate(name, 0)
+	if err != nil {
+		return nil, fmt.Errorf("memfd_create: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	var b strings.Builder
+	for _, l := range lines {
+		b.WriteString(l)
+		b.WriteByte(0)
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // Stop 终止代理。先关闭 sync 读端触发 xdg-dbus-proxy 的

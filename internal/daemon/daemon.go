@@ -27,6 +27,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"cwrap/internal/bwrap"
+	"cwrap/internal/config"
 	"cwrap/internal/dbusproxy"
 	"cwrap/internal/ipc"
 	"cwrap/internal/perm"
@@ -368,12 +369,20 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 	}
 	defer logw.Close()
 
+	// 程序级配置（~/.config/cwrap/config.toml）：可自定义 bwrap 与
+	// xdg-dbus-proxy 的可执行路径；未配置时按 PATH 查找。
+	prog, perr := config.LoadProgram()
+	if perr != nil {
+		fail("%v", perr)
+		return
+	}
+
 	// D-Bus 代理（默认零规则，仅显式授权）
 	session, system := dbusproxy.NeedBuses(spec)
 	if session {
 		addr, aerr := dbusproxy.SessionAddress()
 		if aerr == nil {
-			sessionProxy, aerr = dbusproxy.Start(addr, filepath.Join(dir, "session"), spec.DBus, logw)
+			sessionProxy, aerr = dbusproxy.Start(prog.DBusProxyCmd(), addr, filepath.Join(dir, "session"), spec.DBus, logw)
 		}
 		if aerr != nil {
 			fail("%v", aerr)
@@ -386,7 +395,7 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 			fail("宿主系统总线 socket 不存在（/run/dbus/system_bus_socket）")
 			return
 		}
-		sp, aerr := dbusproxy.Start(addr, filepath.Join(dir, "system"), spec.DBus, logw)
+		sp, aerr := dbusproxy.Start(prog.DBusProxyCmd(), addr, filepath.Join(dir, "system"), spec.DBus, logw)
 		if aerr != nil {
 			fail("%v", aerr)
 			return
@@ -481,7 +490,18 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		return
 	}
 
-	cmd := exec.Command("bwrap", args...)
+	// bwrap 参数经 --args FD 传递（bubblejail 同款方式）：
+	// 命令行只剩 --args <fd>，彻底规避 ARG_MAX，参数不再暴露在
+	// /proc/<pid>/cmdline 中；fd 在 ExtraFiles 末尾追加。
+	argsFile, werr := memfdWrite("cwrap-bwrap-args", strings.Join(args, "\x00")+"\x00")
+	if werr != nil {
+		fail("%v", werr)
+		return
+	}
+	extraFiles = append(extraFiles, argsFile)
+	argsFD := fdNo()
+
+	cmd := exec.Command(prog.BwrapCmd(), "--args", strconv.Itoa(argsFD))
 	cmd.Stdin = stdio[0]
 	cmd.Stdout = stdio[1]
 	cmd.Stderr = stdio[2]

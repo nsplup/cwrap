@@ -490,10 +490,28 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		return
 	}
 
-	// bwrap 参数经 --args FD 传递（bubblejail 同款方式）：
-	// 命令行只剩 --args <fd>，彻底规避 ARG_MAX，参数不再暴露在
-	// /proc/<pid>/cmdline 中；fd 在 ExtraFiles 末尾追加。
-	argsFile, werr := memfdWrite("cwrap-bwrap-args", strings.Join(args, "\x00")+"\x00")
+	// bwrap 参数经 --args FD 传递（bubblejail 同款方式），彻底规避 ARG_MAX，
+	// 参数不再暴露在 /proc/<pid>/cmdline 中。
+	//
+	// bwrap --args 的语义（源码 bubblewrap.c，v0.11 确认）：
+	//   1. fd 内容按 NUL 分割逐个作为参数；
+	//   2. fd 内容被"递归解析"，遇到 "--" 即停止，其后内容被丢弃且
+	//      不会回传外层——因此 fd 只能放选项，"--" 与命令必须留在命令行；
+	//   3. 解析完 fd 后，bwrap 继续解析命令行剩余参数；命令行解析完
+	//      若无剩余命令参数，bwrap 会打印 usage 并以退出码 1 退出
+	//      （无错误信息，argc <= 0 → usage(EXIT_FAILURE, stderr)）。
+	sep := -1
+	for i, a := range args {
+		if a == "--" {
+			sep = i
+			break
+		}
+	}
+	fdArgs, tailArgs := args, []string(nil)
+	if sep >= 0 {
+		fdArgs, tailArgs = args[:sep], args[sep:]
+	}
+	argsFile, werr := memfdWrite("cwrap-bwrap-args", strings.Join(fdArgs, "\x00")+"\x00")
 	if werr != nil {
 		fail("%v", werr)
 		return
@@ -501,7 +519,8 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 	extraFiles = append(extraFiles, argsFile)
 	argsFD := fdNo()
 
-	cmd := exec.Command(prog.BwrapCmd(), "--args", strconv.Itoa(argsFD))
+	// 命令行：--args <fd> + "--" 与命令（tailArgs 以 "--" 开头）
+	cmd := exec.Command(prog.BwrapCmd(), append([]string{"--args", strconv.Itoa(argsFD)}, tailArgs...)...)
 	cmd.Stdin = stdio[0]
 	cmd.Stdout = stdio[1]
 	cmd.Stderr = stdio[2]

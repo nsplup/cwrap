@@ -183,9 +183,9 @@ func Start(proxyPath, addr, socketPath string, rules []string, logw io.Writer) (
 	return pr, nil
 }
 
-// memfdLines 把参数逐行写入 memfd 并回卷偏移（供 --args=FD 读取）。
-// 参数本身不含换行时每行恰好一个参数；cwrap 生成的参数（路径/总线名/
-// 规则）均不含换行。
+// memfdLines 把参数按 NUL 分隔写入 memfd 并回卷偏移（供 --args=FD 读取）。
+// xdg-dbus-proxy 的 add_args() 按 NUL 分割、尾部 NUL 不产生空参数；
+// cwrap 生成的参数（路径/总线名/规则）本身不含 NUL。
 func memfdLines(name string, lines []string) (*os.File, error) {
 	fd, err := unix.MemfdCreate(name, 0)
 	if err != nil {

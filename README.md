@@ -130,9 +130,14 @@ xdg_dbus_proxy_path = "/opt/bin/xdg-dbus-proxy" # 默认 "xdg-dbus-proxy"
 
 ## 参数传递方式
 
-bwrap 与 xdg-dbus-proxy 的全部参数均经 **fd 传递**（`bwrap --args FD` /
-`xdg-dbus-proxy --args=FD`，bubblejail 同款方式）：命令行只保留 fd 编号，
-彻底规避 ARG_MAX 限制，参数也不会暴露在 `/proc/<pid>/cmdline` 中。
+bwrap 与 xdg-dbus-proxy 的全部参数均经 **fd 传递**，彻底规避 ARG_MAX，
+参数也不再暴露在 `/proc/<pid>/cmdline` 中：
+
+- **bwrap**：`bwrap --args FD -- 命令 [参数...]`——fd 内容为 **NUL 分隔的选项**；
+  受 bwrap 语义限制（fd 内容遇 `--` 即停止解析且其后被丢弃），`--` 与
+  命令必须留在命令行（bubblejail 同款方式）；
+- **xdg-dbus-proxy**：`xdg-dbus-proxy --fd=3 --args=4`——总线地址、socket
+  路径、`--filter` 与全部规则均 NUL 分隔后进 fd。
 
 ## 架构
 

@@ -251,6 +251,11 @@ func Args(o *Options) ([]string, error) {
 		a = append(a, "--dir", "/run/cwrap")
 		a = append(a, "--ro-bind", o.DBusSessionPath, "/run/cwrap/sessionBus")
 		sockEnv["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/cwrap/sessionBus"
+	} else if !perm.Has(p.Socket, "session-bus") {
+		// 对齐 flatpak：未授予会话总线时显式设为 "disabled"——
+		// GLib ≥2.80 会静默接受（配合 /.flatpak-info 的 flatpak 语义），
+		// 避免 Chromium 等回退到 autolaunch 拉起 dbus-daemon。
+		sockEnv["DBUS_SESSION_BUS_ADDRESS"] = "disabled"
 	}
 	if o.DBusSystemPath != "" {
 		a = append(a, "--dir", "/run/cwrap")

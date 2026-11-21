@@ -54,8 +54,12 @@ cwrap run --app demo --no-socket x11 -- /usr/bin/myapp
 # D-Bus 预设（bubblejail notify/systray/gamemode/mpris 服务）
 cwrap run --app demo --dbus preset:notify --dbus preset:mpris='firefox.*' -- /usr/bin/myapp
 
-# portal 权限包（伪 .flatpak-info + GTK_USE_PORTAL + xdg-open 覆盖）
+# portal 权限包（伪 .flatpak-info + GTK_USE_PORTAL + xdg-open 覆盖；
+# 自动注入 portal 的 D-Bus 规则，settings portal / 文件选择器可用）
 cwrap run --app demo --allow portal -- /usr/bin/myapp
+
+# portal + 托盘（libayatana/StatusNotifier 需要显式授予 systray 预设）
+cwrap run --app demo --allow portal --dbus preset:systray -- /usr/bin/myapp
 
 # 手柄 / 摄像头 / Wine ntsync（bubblejail joystick/v4l/ntsync 服务）
 cwrap run --app demo --device input,v4l,ntsync -- /usr/bin/game

@@ -377,6 +377,15 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		return
 	}
 
+	// --allow portal 的 D-Bus 规则注入必须发生在 NeedBuses 判断**之前**：
+	// portal 预设包含对 org.freedesktop.portal.Desktop 的 talk/call 规则，
+	// 没有它，沙箱内没有会话总线，GTK/GIO 会因伪造的 /.flatpak-info 把
+	// DBUS_SESSION_BUS_ADDRESS 视作 "disabled:"（GLib ≥2.80 对 flatpak
+	// 沙箱的约定），settings portal 与托盘全部失效。
+	if perm.Has(spec.Allow, "portal") && !strings.Contains(strings.Join(spec.DBus, ","), "preset:portal") {
+		spec.DBus = append(spec.DBus, "preset:portal")
+	}
+
 	// D-Bus 代理（默认零规则，仅显式授权）
 	session, system := dbusproxy.NeedBuses(spec)
 	if session {
@@ -424,12 +433,9 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 	}
 
 	// --allow portal（对齐 bubblejail xdg_desktop_portal 服务）：
-	// 伪造 /.flatpak-info 诱导应用走 portal；无显式 D-Bus 规则时自动注入 portal 预设。
+	// 伪造 /.flatpak-info 诱导应用走 portal；D-Bus 规则已在上方注入。
 	flatpakInfoFD := 0
 	if perm.Has(spec.Allow, "portal") {
-		if !strings.Contains(strings.Join(spec.DBus, ","), "preset:portal") {
-			spec.DBus = append(spec.DBus, "preset:portal")
-		}
 		f, ferr := memfdWrite("flatpak-info", flatpakInfoContent)
 		if ferr != nil {
 			fail("%v", ferr)

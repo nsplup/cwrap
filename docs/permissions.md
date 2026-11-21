@@ -108,9 +108,16 @@ public-share/templates/videos`；尾缀 `?` 表示目标不存在不报错
 
 ## D-Bus
 
-- 未授予任何 `--dbus`/socket 总线权限时**不启动代理**，沙箱内没有总线。
+- 未授予任何 `--dbus`/socket 总线权限时**不启动代理**，沙箱内没有总线；
+  此时 `DBUS_SESSION_BUS_ADDRESS` 被显式设为 `disabled`（对齐 flatpak，
+  GLib ≥2.80 会静默接受）。
 - 授予后由 `xdg-dbus-proxy` 接管，`--filter` 生效且默认零放行规则；
   规则按 `session.`/`system.` 前缀分流到对应代理。
+- **`--allow portal` 会自动注入 `preset:portal` 规则**（在总线判定之前），
+  因此 portal 包自带可用的会话总线（仅 portal 访问）。
+- **托盘图标**（libayatana/StatusNotifier）需要显式授予：
+  `--dbus preset:systray`；同时需要会话总线（portal 包或任意 dbus 规则
+  均可提供）。
 - 代理 socket 写入 `$XDG_RUNTIME_DIR/cwrap/<时间戳>/session|system`，
   结束后由 cwrapd 清理；沙箱内地址固定 `/run/cwrap/sessionBus|systemBus`。
 

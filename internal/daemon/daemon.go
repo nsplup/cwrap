@@ -811,9 +811,10 @@ func generateFlatpakInfo(spec *perm.Permissions, instanceID string) string {
 		}
 		switch pol {
 		case "talk", "own", "see":
-			if bus == "session" {
+			switch bus {
+			case "session":
 				sessionPolicy = append(sessionPolicy, fmt.Sprintf("%s=%s", name, pol))
-			} else if bus == "system" {
+			case "system":
 				systemPolicy = append(systemPolicy, fmt.Sprintf("%s=%s", name, pol))
 			}
 		}
@@ -831,11 +832,6 @@ func generateFlatpakInfo(spec *perm.Permissions, instanceID string) string {
 		}
 	}
 	return b.String()
-}
-
-// jsonString 输出带引号的 JSON 字符串（内容为自生成字段）。
-func jsonString(s string) string {
-	return "\"" + strings.ReplaceAll(s, "\"", "\\\"") + "\""
 }
 
 // xdgRuntimeDirForPortal 返回宿主侧运行时目录（bwrapinfo.json 的落盘位置）。

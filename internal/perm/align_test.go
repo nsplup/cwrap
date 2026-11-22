@@ -72,8 +72,10 @@ func TestExpandDbusPresets(t *testing.T) {
 	portal, _ := ExpandDbusPresets([]string{"preset:portal"})
 	joined := strings.Join(portal, "\n")
 	for _, want := range []string{
-		"session.talk=org.freedesktop.portal.Desktop",
-		"org.freedesktop.portal.Request.*@/org/freedesktop/portal/desktop/request/*",
+		// 对齐 flatpak：talk + 任意接口 call + /org/freedesktop/portal/* 广播
+		"session.talk=org.freedesktop.portal.*",
+		"session.call=org.freedesktop.portal.*=*",
+		"session.broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("portal 预设缺少 %s", want)

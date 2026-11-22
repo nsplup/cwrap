@@ -33,6 +33,7 @@ type Options struct {
 	FlatpakInfoFD int // memfd 伪 /.flatpak-info（--allow portal；0 = 不传）
 	InfoFD        int // --info-fd（网络后端需要沙箱 PID；0 = 不传）
 	NetResolvFD   int // memfd DNS 配置（slirp4netns/pasta 后端；0 = 不传）
+	StatusFD      int // --json-status-fd（让 bwrap 自己写 bwrapinfo.json；0 = 不传）
 }
 
 // Args 生成完整 bwrap 参数（不含 bwrap 自身路径）。
@@ -83,6 +84,10 @@ func Args(o *Options) ([]string, error) {
 	// 网络后端需要 --info-fd 取沙箱 PID（daemon 用它挂接 pasta/slirp4netns）
 	if o.InfoFD > 0 {
 		a = append(a, "--info-fd", strconv.Itoa(o.InfoFD))
+	}
+
+	if o.StatusFD > 0 {
+		a = append(a, "--json-status-fd", strconv.Itoa(o.StatusFD))
 	}
 
 	// 基础系统目录（只读）
@@ -263,12 +268,18 @@ func Args(o *Options) ([]string, error) {
 		sockEnv["DBUS_SYSTEM_BUS_ADDRESS"] = "unix:path=/run/cwrap/systemBus"
 	}
 
-	// portal 权限包（对齐 bubblejail xdg_desktop_portal 服务）
+	// portal 权限包（对齐 flatpak xdg_desktop_portal + bubblejail 同名服务）
 	if perm.Has(p.Allow, "portal") {
 		if o.FlatpakInfoFD > 0 {
 			a = append(a, "--ro-bind-data", strconv.Itoa(o.FlatpakInfoFD), "/.flatpak-info")
 		}
 		sockEnv["GTK_USE_PORTAL"] = "1"
+		// Document portal 挂载点：flatpak 对所有沙箱 rw bind
+		// /run/user/<uid>/doc——文件对话框返回的 URI（by-app/...）与
+		// 按 path 的后续读写都依赖它（fd 直传之外的全部路径操作）。
+		if docDir := filepath.Join(xdgRuntimeDir(uid), "doc"); docDir != "" {
+			a = append(a, "--bind-try", docDir, filepath.Join(rtIn, "doc"))
+		}
 		// flatpak-xdg-utils 提供的 xdg-open 走 portal OpenURI
 		if _, err := os.Stat("/usr/lib/flatpak-xdg-utils/xdg-open"); err == nil {
 			a = append(a, "--ro-bind-try", "/usr/lib/flatpak-xdg-utils/xdg-open", "/usr/bin/xdg-open")

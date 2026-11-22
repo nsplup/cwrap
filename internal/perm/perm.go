@@ -345,13 +345,16 @@ func ExpandDbusPresets(tokens []string) ([]string, error) {
 			}
 			out = append(out, "session.own=org.mpris.MediaPlayer2."+glob)
 		case "portal":
-			// 对齐 bubblejail xdg_desktop_portal 服务：基座 + Request/Session 回执
+			// 对齐 flatpak（flatpak-run-dbus.c）：portal 是设计上的能力入口，
+			// 默认放行全部 portal 接口的调用与 /org/freedesktop/portal/* 下的
+			// 广播；各接口在服务端按 caller app-id 二次授权（Document portal
+			// 授权表、ScreenCast 恢复 token 等）。caller 身份由 /proc/<代理pid>/
+			// root/.flatpak-info + $XDG_RUNTIME_DIR/.flatpak/<instance-id>/
+			// bwrapinfo.json 验证（见 daemon 与 dbusproxy 的对应实现）。
 			out = append(out,
-				"session.talk=org.freedesktop.portal.Desktop",
-				"session.call=org.freedesktop.portal.Desktop=org.freedesktop.DBus.Properties.*@/org/freedesktop/portal/desktop",
-				"session.call=org.freedesktop.portal.Desktop=org.freedesktop.portal.*@/org/freedesktop/portal/desktop",
-				"session.call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Request.*@/org/freedesktop/portal/desktop/request/*",
-				"session.call=org.freedesktop.portal.Desktop=org.freedesktop.portal.Session.*@/org/freedesktop/portal/desktop/session/*",
+				"session.talk=org.freedesktop.portal.*",
+				"session.call=org.freedesktop.portal.*=*",
+				"session.broadcast=org.freedesktop.portal.*=@/org/freedesktop/portal/*",
 			)
 		case "gnome-toolkit":
 			out = append(out,

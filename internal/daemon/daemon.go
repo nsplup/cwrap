@@ -10,6 +10,8 @@ package daemon
 import (
 	"bufio"
 	"bytes"
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -337,13 +339,28 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		return
 	}
 
+	// 这四个变量必须在 cleanup 闭包定义之前用 var 声明——闭包通过引用
+	// 捕获它们，赋值可以晚于闭包定义，但声明不能晚于闭包定义（Go 词法
+	// 作用域规则）。bwrapInfoFile / instanceDir 仅在 --allow portal 时赋值，
+	// 由 cleanup 在退出/失败路径统一关闭与清理。
 	var sessionProxy, systemProxy *dbusproxy.Proxy
 	var seccompFile *os.File
+	var bwrapInfoFile *os.File
+	var instanceDir string
+
 	cleanup := func() {
 		stopBoth(sessionProxy, systemProxy)
 		if seccompFile != nil {
 			seccompFile.Close()
 			seccompFile = nil
+		}
+		if bwrapInfoFile != nil {
+			bwrapInfoFile.Close()
+			bwrapInfoFile = nil
+		}
+		if instanceDir != "" {
+			os.RemoveAll(instanceDir)
+			instanceDir = ""
 		}
 		os.RemoveAll(dir)
 	}
@@ -386,12 +403,26 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		spec.DBus = append(spec.DBus, "preset:portal")
 	}
 
-	// D-Bus 代理（默认零规则，仅显式授权）
+	// --allow portal：按应用独立生成 instance-id 与规范 .flatpak-info。
+	// instance-id 同时作为 $XDG_RUNTIME_DIR/.flatpak/<id>/ 目录名——
+	// portal 先读代理命名空间里的 /.flatpak-info 拿到 instance-id，
+	// 再去该目录读 bwrapinfo.json 验证 child-pid。
+	var instanceID, flatpakInfoContent string
+	if perm.Has(spec.Allow, "portal") {
+		instanceID = newInstanceID()
+		flatpakInfoContent = generateFlatpakInfo(spec, instanceID)
+	}
+
+	// D-Bus 代理（默认零规则，仅显式授权）。
+	// portal 场景下代理由 bwrap 包装运行（对齐 flatpak add_bwrap_wrapper），
+	// 使其命名空间根里可见 /.flatpak-info——portal 通过 /proc/<代理pid>/root
+	// 读取它识别 caller 身份。
 	session, system := dbusproxy.NeedBuses(spec)
 	if session {
 		addr, aerr := dbusproxy.SessionAddress()
 		if aerr == nil {
-			sessionProxy, aerr = dbusproxy.Start(prog.DBusProxyCmd(), addr, filepath.Join(dir, "session"), spec.DBus, logw)
+			sessionProxy, aerr = dbusproxy.Start(prog.BwrapCmd(), prog.DBusProxyCmd(), addr,
+				filepath.Join(dir, "session"), spec.DBus, []byte(flatpakInfoContent), logw)
 		}
 		if aerr != nil {
 			fail("%v", aerr)
@@ -404,7 +435,8 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 			fail("宿主系统总线 socket 不存在（/run/dbus/system_bus_socket）")
 			return
 		}
-		sp, aerr := dbusproxy.Start(prog.DBusProxyCmd(), addr, filepath.Join(dir, "system"), spec.DBus, logw)
+		sp, aerr := dbusproxy.Start(prog.BwrapCmd(), prog.DBusProxyCmd(), addr,
+			filepath.Join(dir, "system"), spec.DBus, []byte(flatpakInfoContent), logw)
 		if aerr != nil {
 			fail("%v", aerr)
 			return
@@ -432,8 +464,7 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		seccompFD = fdNo()
 	}
 
-	// --allow portal（对齐 bubblejail xdg_desktop_portal 服务）：
-	// 伪造 /.flatpak-info 诱导应用走 portal；D-Bus 规则已在上方注入。
+	// --allow portal：规范 .flatpak-info 以 --ro-bind-data 挂到沙箱根。
 	flatpakInfoFD := 0
 	if perm.Has(spec.Allow, "portal") {
 		f, ferr := memfdWrite("flatpak-info", flatpakInfoContent)
@@ -445,8 +476,36 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		flatpakInfoFD = fdNo()
 	}
 
+	// --allow portal：创建 $XDG_RUNTIME_DIR/.flatpak/<instance-id>/，
+	// 打开 bwrapinfo.json 写端 fd，作为 --json-status-fd 交给 bwrap。
+	// bwrap 在沙箱进程就绪后自行写入 { "child-pid": N }——这是
+	// xdg-desktop-portal 反伪造验证的权威来源。切勿用手写 JSON 替代
+	// （原 writeInstanceMeta 的做法既无法保证 child-pid 是 bwrap 视图
+	// 内的真实值，也与 bwrap 写出的格式存在字段/时序偏差）。
+	statusFD := 0
+	if perm.Has(spec.Allow, "portal") && instanceID != "" {
+		instanceDir = filepath.Join(xdgRuntimeDirForPortal(), ".flatpak", instanceID)
+		if merr := os.MkdirAll(instanceDir, 0o700); merr != nil {
+			fail("创建 portal 实例目录 %s: %v", instanceDir, merr)
+			return
+		}
+		bwrapInfoFile, err = os.OpenFile(filepath.Join(instanceDir, "bwrapinfo.json"),
+			os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			fail("打开 bwrapinfo.json: %v", err)
+			return
+		}
+		extraFiles = append(extraFiles, bwrapInfoFile)
+		statusFD = fdNo()
+	}
+
 	// 网络后端（对齐 bubblejail slirp4netns / pasta_network 服务）：
 	// 强制独立 netns，用 --info-fd 拿沙箱 PID 后在宿主侧挂接用户态网络栈。
+	//
+	// 注意：--info-fd 的启用条件已不再包含 --allow portal。
+	// portal 身份链的 child-pid 由 bwrap 通过 --json-status-fd 自行
+	// 写入 bwrapinfo.json，info-fd 仅用于网络后端挂接；两者互不依赖，
+	// portal 场景不再因为 info-fd 读取超时而整体失败。
 	backend := spec.UserNetBackend()
 	var netInfoR, netReadyR *os.File
 	infoFD, netResolvFD := 0, 0
@@ -459,6 +518,8 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		extraFiles = append(extraFiles, w)
 		infoFD = fdNo()
 		netInfoR = r
+	}
+	if backend == "pasta" || backend == "slirp4netns" {
 		f, rerr := memfdWrite("resolv.conf", "nameserver 10.0.2.3\n")
 		if rerr != nil {
 			fail("%v", rerr)
@@ -488,6 +549,7 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		FlatpakInfoFD:   flatpakInfoFD,
 		InfoFD:          infoFD,
 		NetResolvFD:     netResolvFD,
+		StatusFD:        statusFD,
 		CmdPath:         req.Argv[0],
 		CmdArgs:         req.Argv[1:],
 	})
@@ -543,18 +605,26 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 	entry := &runEntry{id: id, app: spec.App, cmd: cmd, dir: dir,
 		pgid: cmd.Process.Pid, startTicks: st}
 
-	// 网络后端挂接：读 --info-fd 的 {"pid":N}，拉起 pasta / slirp4netns
-	var netBackendCmd *exec.Cmd
-	if backend == "pasta" || backend == "slirp4netns" {
+	// 读取沙箱 PID（--info-fd）：仅网络后端使用。
+	// portal 身份链不依赖此值——bwrap 已通过 --json-status-fd 把
+	// child-pid 写入 bwrapinfo.json。此处超时仅影响网络后端。
+	sandboxPID := -1
+	if infoFD > 0 {
 		pid, rerr := readSandboxPID(netInfoR)
 		if rerr != nil {
 			killGroupSafe(entry, syscall.SIGKILL)
 			cmd.Wait()
 			cleanup()
-			ipc.WriteJSON(uc, ipc.Response{Ok: false, Error: "读取沙箱 PID 失败: " + rerr.Error()})
+			ipc.WriteJSON(uc, ipc.Response{Ok: false, Error: "读取沙箱 PID 失败（网络后端需要）: " + rerr.Error()})
 			return
 		}
-		nb, nerr := startNetBackend(backend, pid, spec.NetBackendArgs, netReadyR)
+		sandboxPID = pid
+	}
+
+	// 网络后端挂接：拉起 pasta / slirp4netns
+	var netBackendCmd *exec.Cmd
+	if backend == "pasta" || backend == "slirp4netns" {
+		nb, nerr := startNetBackend(backend, sandboxPID, spec.NetBackendArgs, netReadyR)
 		if nerr != nil {
 			killGroupSafe(entry, syscall.SIGKILL)
 			cmd.Wait()
@@ -652,7 +722,6 @@ loop:
 		}
 	}
 	ipc.WriteJSON(uc, resp)
-
 }
 
 func proxyPath(p *dbusproxy.Proxy, def string) string {
@@ -667,16 +736,115 @@ func stopBoth(a, b *dbusproxy.Proxy) {
 	b.Stop()
 }
 
-// flatpakInfoContent 是伪 /.flatpak-info 的最小内容：
-// 足以让 GTK/portal 客户端判定"运行在 flatpak 沙箱内"从而走 portal。
-const flatpakInfoContent = "[Application]\n" +
-	"name=org.cwrap.Sandbox\n" +
-	"runtime=org.cwrap.Platform/x86_64/stable\n" +
-	"\n[Context]\n" +
-	"shared=network;ipc;\n" +
-	"sockets=x11;wayland;pulseaudio;fallback-audio-for-v2;\n" +
-	"\n[Instance]\n" +
-	"instance-id=cwrap\n"
+// newInstanceID 生成 32 位 hex 随机实例 ID（对齐 flatpak Instance.instance-id）。
+func newInstanceID() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%032x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// dbusNameSegment 把应用名清洗为合法的 D-Bus app-id 段：
+// 仅保留 [a-z0-9_-]（小写），段首必须是字母（xdp_is_valid_app_id 的
+// flatpak 规则），不满足时补 "app-" 前缀。
+func dbusNameSegment(app string) string {
+	s := strings.ToLower(app)
+	var b strings.Builder
+	for _, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_':
+			b.WriteRune(c)
+		default:
+			b.WriteByte('-') // 非法字符（空格、点、符号等）折叠为连字符
+		}
+	}
+	seg := strings.Trim(b.String(), "-")
+	if seg == "" || !(seg[0] >= 'a' && seg[0] <= 'z') {
+		seg = "app-" + seg
+	}
+	return seg
+}
+
+// flatpakAppName 返回伪造 .flatpak-info 的 [Application] name：
+// 按应用独立（xdg-desktop-portal 与 GIO document portal 客户端都以它
+// 构造 by-app 授权身份），无应用名时回退 org.cwrap.Sandbox。
+func flatpakAppName(spec *perm.Permissions) string {
+	if spec.App == "" {
+		return "org.cwrap.Sandbox"
+	}
+	return "org.cwrap.App." + dbusNameSegment(spec.App)
+}
+
+// generateFlatpakInfo 生成规范形态的 /.flatpak-info（对齐 flatpak 元数据）：
+// xdg-desktop-portal 读取 [Application] name 与 [Instance] instance-id
+// 识别 caller；GIO document portal 客户端读 name 构造 by-app URI；
+// [Context]/[Session Bus Policy]/[System Bus Policy] 为规范字段。
+func generateFlatpakInfo(spec *perm.Permissions, instanceID string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[Application]\n")
+	fmt.Fprintf(&b, "name=%s\n", flatpakAppName(spec))
+	fmt.Fprintf(&b, "runtime=org.cwrap.Platform/x86_64/stable\n")
+	fmt.Fprintf(&b, "\n[Instance]\n")
+	fmt.Fprintf(&b, "instance-id=%s\n", instanceID)
+	fmt.Fprintf(&b, "\n[Context]\n")
+	fmt.Fprintf(&b, "shared=%s;\n", strings.Join(spec.Share, ";"))
+	fmt.Fprintf(&b, "sockets=%s;\n", strings.Join(spec.Socket, ";"))
+	fmt.Fprintf(&b, "devices=%s;\n", strings.Join(spec.Device, ";"))
+	fmt.Fprintf(&b, "filesystems=%s;\n", strings.Join(spec.FS, ";"))
+
+	// [Session Bus Policy] / [System Bus Policy]：talk/own/see 规则
+	// （call/broadcast 不属于该节）。预设先展开，保证与代理规则一致。
+	tokens, err := perm.ExpandDbusPresets(spec.DBus)
+	if err != nil {
+		tokens = spec.DBus
+	}
+	sessionPolicy, systemPolicy := []string{}, []string{}
+	for _, tok := range tokens {
+		tgt, name, ok := strings.Cut(tok, "=")
+		if !ok || name == "" {
+			continue
+		}
+		bus, pol, ok := strings.Cut(tgt, ".")
+		if !ok {
+			continue
+		}
+		switch pol {
+		case "talk", "own", "see":
+			if bus == "session" {
+				sessionPolicy = append(sessionPolicy, fmt.Sprintf("%s=%s", name, pol))
+			} else if bus == "system" {
+				systemPolicy = append(systemPolicy, fmt.Sprintf("%s=%s", name, pol))
+			}
+		}
+	}
+	if len(sessionPolicy) > 0 {
+		fmt.Fprintf(&b, "\n[Session Bus Policy]\n")
+		for _, l := range sessionPolicy {
+			fmt.Fprintf(&b, "%s\n", l)
+		}
+	}
+	if len(systemPolicy) > 0 {
+		fmt.Fprintf(&b, "\n[System Bus Policy]\n")
+		for _, l := range systemPolicy {
+			fmt.Fprintf(&b, "%s\n", l)
+		}
+	}
+	return b.String()
+}
+
+// jsonString 输出带引号的 JSON 字符串（内容为自生成字段）。
+func jsonString(s string) string {
+	return "\"" + strings.ReplaceAll(s, "\"", "\\\"") + "\""
+}
+
+// xdgRuntimeDirForPortal 返回宿主侧运行时目录（bwrapinfo.json 的落盘位置）。
+func xdgRuntimeDirForPortal() string {
+	if v := os.Getenv("XDG_RUNTIME_DIR"); v != "" {
+		return v
+	}
+	return fmt.Sprintf("/run/user/%d", syscall.Getuid())
+}
 
 // memfdWrite 把内容写入匿名 memfd 并回卷偏移（供 bwrap --ro-bind-data 读取）。
 func memfdWrite(name, content string) (*os.File, error) {

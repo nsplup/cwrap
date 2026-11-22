@@ -115,6 +115,17 @@ public-share/templates/videos`；尾缀 `?` 表示目标不存在不报错
   规则按 `session.`/`system.` 前缀分流到对应代理。
 - **`--allow portal` 会自动注入 `preset:portal` 规则**（在总线判定之前），
   因此 portal 包自带可用的会话总线（仅 portal 访问）。
+- **portal 身份链**（对齐 flatpak）：`--allow portal` 时伪造规范形态的
+  `/.flatpak-info`（`[Application] name = org.cwrap.App.<应用名>`，按应用
+  独立），xdg-dbus-proxy 由 bwrap 包装运行使其命名空间根里可见该文件
+  （flatpak `add_bwrap_wrapper` 同款），并落盘
+  `$XDG_RUNTIME_DIR/.flatpak/<instance-id>/bwrapinfo.json`（含沙箱
+  child-pid）——这三者共同通过 xdg-desktop-portal 的 caller 身份验证；
+  缺失任一项则 caller 被当作宿主应用（bubblejail 式妥协）。
+  Document portal 挂载点（`/run/user/<uid>/doc`，rw）同步自动挂载。
+- portal 预设规则为 flatpak 同款宽规则：talk + 任意接口 call +
+  `/org/freedesktop/portal/*` 广播；各接口在服务端按 caller app-id
+  二次授权。与其他 dbus 规则重叠时为并集语义（xdg-dbus-proxy 不报错）。
 - **托盘图标**（libayatana/StatusNotifier）需要显式授予：
   `--dbus preset:systray`；同时需要会话总线（portal 包或任意 dbus 规则
   均可提供）。

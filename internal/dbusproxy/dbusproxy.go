@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -128,7 +129,14 @@ func dbusProxyArgs(rules []string) ([]string, error) {
 //
 // 全部位置参数与规则经 --args=4（fd 4）传递，命令行只保留 --fd=3 与
 // --args=4：彻底规避 ARG_MAX，参数也不再暴露在 /proc/<pid>/cmdline。
-func Start(proxyPath, addr, socketPath string, rules []string, logw io.Writer) (*Proxy, error) {
+//
+// flatpakInfo 非 nil 时，代理由 bwrap 包装运行（对齐 flatpak
+// add_bwrap_wrapper）：宿主根目录逐项挂入代理命名空间，并把规范形态的
+// /.flatpak-info 以 --ro-bind-data 挂到代理的根。这是 xdg-desktop-portal
+// 识别 caller 身份的前提——portal 经 /proc/<代理pid>/root/.flatpak-info
+// 读取 name 与 instance-id（instance-id 的运行时验证由 daemon 写入
+// $XDG_RUNTIME_DIR/.flatpak/<id>/bwrapinfo.json 完成）。
+func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpakInfo []byte, logw io.Writer) (*Proxy, error) {
 	bus := "session"
 	if strings.HasPrefix(filepath.Base(socketPath), "system") {
 		bus = "system"
@@ -145,9 +153,9 @@ func Start(proxyPath, addr, socketPath string, rules []string, logw io.Writer) (
 	if err != nil {
 		return nil, err
 	}
-	// fd 3 = ready 同步管道；fd 4 = 参数文件（--args=4）
-	argsContent := append([]string{addr, socketPath, "--filter"}, mapped...)
-	argsFile, err := memfdLines("cwrap-dbus-proxy-args", argsContent)
+	// 代理的位置参数与规则经 --args=FD 传入（NUL 分隔）
+	proxyArgsContent := append([]string{addr, socketPath, "--filter"}, mapped...)
+	proxyArgsFile, err := memfdLines("cwrap-dbus-proxy-args", proxyArgsContent)
 	if err != nil {
 		readyR.Close()
 		readyW.Close()
@@ -156,18 +164,55 @@ func Start(proxyPath, addr, socketPath string, rules []string, logw io.Writer) (
 	if proxyPath == "" {
 		proxyPath = config.DefaultDBusProxyCmd
 	}
-	cmd := exec.Command(proxyPath, "--fd=3", "--args=4")
-	cmd.ExtraFiles = []*os.File{readyW, argsFile}
+	// bwrap 在沙箱命名空间内按给定路径 exec 代理，绝对化以稳定解析
+	if !strings.ContainsRune(proxyPath, '/') {
+		if abs, lerr := exec.LookPath(proxyPath); lerr == nil {
+			proxyPath = abs
+		}
+	}
+
+	var cmd *exec.Cmd
+	if len(flatpakInfo) == 0 {
+		// 未启用 portal 包：无需求身份，直接运行代理。
+		// fd 3 = ready 同步管道；fd 4 = 代理参数文件
+		cmd = exec.Command(proxyPath, "--fd=3", "--args=4")
+		cmd.ExtraFiles = []*os.File{readyW, proxyArgsFile}
+	} else {
+		// fd 3 = ready 同步管道；fd 4 = 包装 bwrap 参数；fd 5 = 代理参数；
+		// fd 6 = .flatpak-info（--ro-bind-data）
+		infoFile, ierr := memfdBytes("cwrap-flatpak-info", flatpakInfo)
+		if ierr != nil {
+			readyR.Close()
+			readyW.Close()
+			proxyArgsFile.Close()
+			return nil, ierr
+		}
+		wArgs := dbusProxyWrapperArgs(filepath.Dir(socketPath), 6)
+		wArgsFile, werr := memfdLines("cwrap-bwrap-proxy-args", wArgs)
+		if werr != nil {
+			readyR.Close()
+			readyW.Close()
+			proxyArgsFile.Close()
+			infoFile.Close()
+			return nil, werr
+		}
+		if bwrapPath == "" {
+			bwrapPath = config.DefaultBwrapCmd
+		}
+		// 命令行：bwrap --args 4 -- xdg-dbus-proxy --fd=3 --args=5
+		//（--args fd 内容遇 "--" 停止，命令必须留在命令行，见 daemon 同款注释）
+		cmd = exec.Command(bwrapPath, "--args", "4", "--", proxyPath, "--fd=3", "--args=5")
+		cmd.ExtraFiles = []*os.File{readyW, wArgsFile, proxyArgsFile, infoFile}
+	}
 	cmd.Stdout = logw
 	cmd.Stderr = logw
 	if err := cmd.Start(); err != nil {
 		readyR.Close()
 		readyW.Close()
-		argsFile.Close()
 		return nil, fmt.Errorf("启动 xdg-dbus-proxy（%s）: %w", proxyPath, err)
 	}
 	readyW.Close() // 父进程侧立刻关闭写端
-	argsFile.Close()
+	proxyArgsFile.Close()
 
 	pr := &Proxy{cmd: cmd, ready: readyR}
 	// 等待就绪信号（带超时）
@@ -206,6 +251,57 @@ func memfdLines(name string, lines []string) (*os.File, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// memfdBytes 把字节写入 memfd 并回卷偏移。
+func memfdBytes(name string, data []byte) (*os.File, error) {
+	fd, err := unix.MemfdCreate(name, 0)
+	if err != nil {
+		return nil, fmt.Errorf("memfd_create: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// dbusProxyWrapperArgs 生成包装代理所用 bwrap 的参数（对齐 flatpak
+// add_bwrap_wrapper）：宿主根目录逐项挂入——tmp/var/run 保持读写，
+// 其余目录只读，符号链接原样重建（宿主根上的普通文件不挂）；
+// 代理 socket 所在目录读写（代理在其中创建并 unlink socket）；
+// /.flatpak-info 以 --ro-bind-data（perms 0600）提供——flatpak 注释原话：
+// "primary to allow the command to be run with a proper /.flatpak-info"。
+func dbusProxyWrapperArgs(socketDir string, infoFD int) []string {
+	var a []string
+	if entries, err := os.ReadDir("/"); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if name == ".flatpak-info" {
+				continue
+			}
+			path := "/" + name
+			switch {
+			case name == "tmp" || name == "var" || name == "run":
+				a = append(a, "--bind-try", path, path)
+			case e.Type()&os.ModeSymlink != 0:
+				if tgt, lerr := os.Readlink(path); lerr == nil {
+					a = append(a, "--symlink", tgt, path)
+				}
+			case e.IsDir():
+				a = append(a, "--ro-bind-try", path, path)
+			}
+		}
+	}
+	a = append(a, "--bind-try", socketDir, socketDir)
+	a = append(a, "--perms", "0600",
+		"--ro-bind-data", strconv.Itoa(infoFD), "/.flatpak-info")
+	return a
 }
 
 // Stop 终止代理。先关闭 sync 读端触发 xdg-dbus-proxy 的

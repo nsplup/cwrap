@@ -158,7 +158,7 @@ func Args(o *Options) ([]string, error) {
 
 	// 用户运行时目录基座
 	rtIn := fmt.Sprintf("/run/user/%d", uid)
-	a = append(a, "--dir", rtIn)
+	a = append(a, "--perms", "0700", "--dir", rtIn)
 
 	// socket 授权
 	sockEnv := map[string]string{}

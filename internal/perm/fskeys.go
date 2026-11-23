@@ -55,11 +55,19 @@ func ResolveFSPath(raw string) ([]string, bool, error) {
 		tryOK = true
 		path = strings.TrimSuffix(path, "?")
 	}
-	if path == "/" {
+	// 归一化必须先于禁令判断：否则 "/usr/../" 这类写法在 Clean 后
+	// 才等于 "/"，会绕过根目录禁令。
+	if strings.HasPrefix(path, "/") && filepath.Clean(path) == "/" {
 		return nil, tryOK, fmt.Errorf("--fs 不允许挂载宿主根目录 /（请使用 host 关键字或逐项授权）")
 	}
 	if path == "~" || strings.HasPrefix(path, "~/") {
-		return []string{expandHome(path)}, tryOK, nil
+		// ~ 锚点展开同样禁止上溯出 $HOME（上溯等价于未审查的全盘授权；
+		// 需要时请用绝对路径显式授权）。
+		p2 := expandHome(path)
+		if !withinDir(userHome(), p2) {
+			return nil, tryOK, fmt.Errorf("--fs ~ 不允许上溯出 $HOME：%q（请用绝对路径显式授权）", raw)
+		}
+		return []string{p2}, tryOK, nil
 	}
 	root := path
 	sub := ""
@@ -68,7 +76,11 @@ func ResolveFSPath(raw string) ([]string, bool, error) {
 	}
 	switch root {
 	case "home":
-		return []string{expandHome("~" + "/" + sub)}, tryOK, nil
+		p2 := expandHome("~" + "/" + sub)
+		if sub != "" && !withinDir(userHome(), p2) {
+			return nil, tryOK, fmt.Errorf("--fs home 不允许上溯出 $HOME：%q（请用绝对路径显式授权）", raw)
+		}
+		return []string{p2}, tryOK, nil
 	case "host":
 		dirs, err := hostTopDirs()
 		if err != nil {
@@ -80,16 +92,24 @@ func ResolveFSPath(raw string) ([]string, bool, error) {
 	case "host-etc":
 		return []string{"/etc"}, tryOK, nil
 	case "xdg-config", "xdg-data", "xdg-cache", "xdg-run":
-		base := xdgBase(root)
+		base0 := xdgBase(root)
+		base := base0
 		if sub != "" {
-			base = filepath.Join(base, sub)
+			base = filepath.Join(base0, sub)
+			if !withinDir(base0, base) {
+				return nil, tryOK, fmt.Errorf("--fs %s 不允许上溯出基目录 %s：%q", root, base0, raw)
+			}
 		}
 		return []string{base}, tryOK, nil
 	case "xdg-desktop", "xdg-documents", "xdg-download", "xdg-music",
 		"xdg-pictures", "xdg-public-share", "xdg-templates", "xdg-videos":
-		base := xdgUserDir(root)
+		base0 := xdgUserDir(root)
+		base := base0
 		if sub != "" {
-			base = filepath.Join(base, sub)
+			base = filepath.Join(base0, sub)
+			if !withinDir(base0, base) {
+				return nil, tryOK, fmt.Errorf("--fs %s 不允许上溯出基目录 %s：%q", root, base0, raw)
+			}
 		}
 		return []string{base}, tryOK, nil
 	}
@@ -107,6 +127,15 @@ func ResolveFSPath(raw string) ([]string, bool, error) {
 func FSPathValid(raw string) error {
 	_, _, err := ResolveFSPath(raw)
 	return err
+}
+
+// withinDir 判断 p 是否位于 dir 内或等于 dir（两者均需已 Clean）。
+// 用于 --fs 关键字锚点展开的上溯防护。
+func withinDir(dir, p string) bool {
+	if dir == p {
+		return true
+	}
+	return strings.HasPrefix(p, strings.TrimSuffix(dir, "/")+"/")
 }
 
 func expandHome(p string) string {

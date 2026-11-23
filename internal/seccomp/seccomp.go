@@ -8,9 +8,13 @@
 //	         --allow devel 时剔除调试所需的 ptrace/perf_event_open
 //	high   : 默认拒绝 + 白名单（仅放行常规用户态运行所需集合）
 //
-// W^X 保护仅在 high 档生效：默认禁止 W+X 映射（mmap/mprotect/pkey_mprotect），
-// --allow devel 可解除并放行 ptrace/perf_event_open；--allow-syscall 可向
-// 任意等级追加白名单。
+// W^X 保护仅在 high 档生效：mmap/mprotect/pkey_mprotect 不在白名单，由
+// 独立检查链处理（prot 同时含 W|X 拒绝，合法放行）；--allow devel 可解除
+// （三调用回到白名单）并放行 ptrace/perf_event_open；--allow-syscall 可向
+// 任意等级追加白名单（追加 W^X 三者仍受 W^X 管控）。
+//
+// 当前仅支持 amd64 构建（调用号表为 x86_64）；非 amd64 构建时 Generate
+// 返回错误，low/medium 档因黑名单残缺同样不可用。
 package seccomp
 
 import (
@@ -119,8 +123,13 @@ var allowSetHigh = []string{
 	"getpid", "getppid", "gettid", "getuid", "geteuid", "getgid", "getegid",
 	"getresuid", "getresgid", "getgroups", "setgroups", "setsid",
 	"getpgid", "setpgid", "getpgrp", "getsid",
+	"tkill", "restart_syscall", "pidfd_send_signal",
 	"set_tid_address", "set_robust_list", "get_robust_list",
 	"arch_prctl", "prctl", "capget", "capset",
+	// 同步与资源限制：futex 是 pthread 核心调用（缺失即多线程死锁）；
+	// prlimit64/getrlimit/setrlimit 为 glibc 与运行时常规调用。
+	"futex", "futex_waitv",
+	"getrlimit", "setrlimit", "prlimit64",
 	"sched_yield", "sched_getscheduler", "sched_setscheduler",
 	"sched_getparam", "sched_setparam",
 	"sched_getaffinity", "sched_setaffinity",
@@ -132,10 +141,12 @@ var allowSetHigh = []string{
 	"rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "rt_sigpending",
 	"rt_sigsuspend", "rt_sigtimedwait", "sigaltstack",
 	"signal", "pause",
-	// 内存
-	"brk", "mmap", "munmap", "mremap", "mprotect", "madvise", "msync",
-	"mincore", "mlock", "munlock", "membarrier", "rseq",
-	"pkey_mprotect", "pkey_alloc", "pkey_free",
+	// 内存。mmap/mprotect/pkey_mprotect 不在此白名单——由 genAllow 的
+	// W^X 检查路径处理（prot 含 W|X 拒绝，合法放行），仅 --allow devel
+	// 时回到白名单（见 Generate）。
+	"brk", "munmap", "mremap", "madvise", "msync",
+	"mincore", "mlock", "mlock2", "munlock", "membarrier", "rseq",
+	"pkey_alloc", "pkey_free",
 	// 文件
 	"read", "write", "open", "openat", "openat2", "close",
 	"stat", "fstat", "lstat", "newfstatat", "statx", "poll", "ppoll",
@@ -146,7 +157,7 @@ var allowSetHigh = []string{
 	"mkdir", "mkdirat", "rmdir", "unlink", "unlinkat",
 	"rename", "renameat", "renameat2",
 	"link", "linkat", "symlink", "symlinkat",
-	"readlink", "readlinkat", "chmod", "fchmod", "fchmodat",
+	"readlink", "readlinkat", "chmod", "fchmod", "fchmodat", "fchmodat2",
 	"chown", "fchown", "lchown", "fchownat",
 	"umask", "getcwd", "chdir", "fchdir",
 	"truncate", "ftruncate",
@@ -193,7 +204,9 @@ func Generate(level string, extraAllow []string, develOK, hardenSync bool) ([]by
 	case "high":
 		names := append(append([]string{}, allowSetHigh...), extraAllow...)
 		if develOK {
-			names = append(names, "ptrace", "perf_event_open")
+			// devel 放宽 W^X：三个内存映射调用回到白名单（无 prot 检查）
+			names = append(names, "ptrace", "perf_event_open",
+				"mmap", "mprotect", "pkey_mprotect")
 		}
 		return genAllow(names, develOK, hardenSync)
 	default:
@@ -269,7 +282,7 @@ func (p *progHelp) emitSyncBlock() {
 func (p *progHelp) preamble() error {
 	arch, ok := auditArch()
 	if !ok {
-		return fmt.Errorf("seccomp 过滤器当前仅支持 amd64/arm64 构建")
+		return fmt.Errorf("seccomp 过滤器当前仅支持 amd64 构建（arm64 规划中）")
 	}
 	p.emit(Instr{Code: bpfLDABS, K: offArch}) // A = arch
 	// 命中本机架构 → Jt=1 跳过 ENOSYS → 继续读 nr；
@@ -280,8 +293,9 @@ func (p *progHelp) preamble() error {
 	return nil
 }
 
-// emitWXChecks 追加 W^X 检查：命中 mmap/mprotect/pkey_mprotect 且
-// prot 同时含 W|X 时跳到拒绝，其余情况落到后续指令。
+// emitWXChecks 追加 W^X 检查链：命中 mmap/mprotect/pkey_mprotect 且
+// prot 同时含 W|X 时跳到拒绝；全部未命中或 prot 合法时落到链尾的
+// 无条件放行 ret（genAllow 把该链置于白名单之后、默认拒绝之前）。
 func (p *progHelp) emitWXChecks() {
 	for _, name := range []string{"mmap", "mprotect", "pkey_mprotect"} {
 		nr, ok := num(name)
@@ -293,6 +307,9 @@ func (p *progHelp) emitWXChecks() {
 		p.emit(Instr{Code: bpfAND, K: protWriteExec})
 		p.emitJumpToDeny(bpfJEQ, protWriteExec) // W|X 同时存在 -> 拒绝
 	}
+	// 检查链通过（合法 mmap/prot）：无条件放行。每组"未命中跳过"的
+	// 偏移固定为 3，恰好落在下一组组首或本 ret。
+	p.emit(Instr{Code: bpfRET, K: retAllow})
 }
 
 func genDeny(deny []string, hardenSync bool) ([]byte, error) {
@@ -330,6 +347,11 @@ func genAllow(allow []string, develOK, hardenSync bool) ([]byte, error) {
 		return nil, err
 	}
 	for _, name := range allow {
+		if !develOK && (name == "mmap" || name == "mprotect" || name == "pkey_mprotect") {
+			// 不在白名单放行：交给下方 W^X 检查路径（否则检查不可达，
+			// W^X 保护形同虚设）。--allow-syscall 显式追加三者同样受 W^X 管控。
+			continue
+		}
 		nr, ok := num(name)
 		if !ok {
 			continue
@@ -337,7 +359,7 @@ func genAllow(allow []string, develOK, hardenSync bool) ([]byte, error) {
 		p.emitJumpToAllow(bpfJEQ, nr)
 	}
 	// 未命中白名单的调用此刻 A 仍是 nr 原值，
-	// 在此做 W^X 检查（命中 mmap/mprotect/pkey_mprotect 且 W|X → 拒绝）
+	// 在此做 W^X 检查（W|X → 拒绝；prot 合法或非映射调用 → 链尾放行）
 	if !develOK {
 		p.emitWXChecks()
 	}

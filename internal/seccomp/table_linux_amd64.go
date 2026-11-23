@@ -524,6 +524,24 @@ func num(name string) (uint32, bool) {
 		n, ok = unix.SYS_VFORK, true
 	case "fork":
 		n, ok = unix.SYS_FORK, true
+	case "getrlimit":
+		n, ok = unix.SYS_GETRLIMIT, true
+	case "setrlimit":
+		n, ok = unix.SYS_SETRLIMIT, true
+	case "prlimit64":
+		n, ok = unix.SYS_PRLIMIT64, true
+	case "restart_syscall":
+		n, ok = unix.SYS_RESTART_SYSCALL, true
+	case "tkill":
+		n, ok = unix.SYS_TKILL, true
+	case "mlock2":
+		n, ok = unix.SYS_MLOCK2, true
+	case "pidfd_send_signal":
+		n, ok = unix.SYS_PIDFD_SEND_SIGNAL, true
+	case "futex_waitv":
+		n, ok = unix.SYS_FUTEX_WAITV, true
+	case "fchmodat2":
+		n, ok = unix.SYS_FCHMODAT2, true
 	}
 	if !ok {
 		return 0, false

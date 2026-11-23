@@ -216,34 +216,6 @@ func inList(list []string, v string) bool {
 // Has 判断列表是否包含某值。
 func Has(list []string, v string) bool { return inList(list, v) }
 
-// ---------- 便捷判定 ----------
-
-// ShareNet 返回是否共享宿主网络。
-func (p *Permissions) ShareNet() bool {
-	if p.NetBackend != "" && p.NetBackend != "host" {
-		return false // 用户态网络后端下必然与宿主隔离
-	}
-	return inList(p.Share, "network")
-}
-
-// ShareIPC 返回是否共享宿主 IPC。
-func (p *Permissions) ShareIPC() bool { return inList(p.Share, "ipc") }
-
-// Sock 返回是否授予某类 socket。
-func (p *Permissions) Sock(name string) bool { return inList(p.Socket, name) }
-
-// Dev 返回是否授予某类设备。
-func (p *Permissions) Dev(name string) bool { return inList(p.Device, name) }
-
-// AllowDevel 返回是否授予 devel（放宽 W^X）。
-func (p *Permissions) AllowDevel() bool { return inList(p.Allow, "devel") }
-
-// AllowPortal 返回是否授予 portal 权限包。
-func (p *Permissions) AllowPortal() bool { return inList(p.Allow, "portal") }
-
-// Hardened 返回是否开启某项加固。
-func (p *Permissions) Hardened(name string) bool { return inList(p.Harden, name) }
-
 // UserNetBackend 返回网络后端（默认 host）。
 func (p *Permissions) UserNetBackend() string {
 	if p.NetBackend == "" {
@@ -286,6 +258,11 @@ func (p *Permissions) DbusRules() ([]DbusRule, error) {
 	}
 	var rules []DbusRule
 	for _, tok := range tokens {
+		// "-" 开头的 token 是原样透传的 xdg-dbus-proxy 参数（--dbus-arg /
+		// raw_dbus），不经 target 校验——由 xdg-dbus-proxy 自行拒绝非法值。
+		if strings.HasPrefix(tok, "-") {
+			continue
+		}
 		idx := strings.Index(tok, "=")
 		if idx < 0 {
 			return nil, fmt.Errorf("无效的 --dbus 项 %q，期望格式 target=NAME（target ∈ %s）", tok, strings.Join(DBusTargets, "|"))
@@ -402,6 +379,32 @@ func (p *Permissions) Validate() error {
 	// 否决项在校验前结算（含配置文件内的 "!" 前缀写法）
 	p.ApplyDenies()
 
+	// 应用名作为配置文件名与 D-Bus app-id 段的来源，禁止路径分隔符等
+	// 非法字符（防止 --app ../../x 越出配置目录；也保证文档语义清晰）。
+	if p.App != "" {
+		for i, c := range p.App {
+			ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+				c >= '0' && c <= '9' && i > 0 || c == '-' || c == '_' || c == '.' && i > 0
+			if !ok {
+				return fmt.Errorf("无效的应用名 %q（仅允许字母开头，可含字母/数字/下划线/连字符）", p.App)
+			}
+		}
+	}
+	// --home / home 配置为宿主侧 rw 挂载锚点，禁止指向系统根与关键
+	// 系统目录（否则等价于 rw 授权整个系统，与逐项 --fs 语义冲突）。
+	if p.Home != "" {
+		h := filepath.Clean(p.Home)
+		if !filepath.IsAbs(h) {
+			return fmt.Errorf("无效的 --home %q（必须是绝对路径）", p.Home)
+		}
+		for _, d := range []string{"/", "/bin", "/boot", "/dev", "/etc",
+			"/lib", "/lib64", "/proc", "/root", "/run", "/sbin",
+			"/sys", "/usr", "/var"} {
+			if h == d {
+				return fmt.Errorf("--home 不允许指向系统目录 %s（请指向专用目录）", d)
+			}
+		}
+	}
 	if p.Seccomp == "" {
 		p.Seccomp = "medium"
 	}

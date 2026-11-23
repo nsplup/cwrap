@@ -5,9 +5,11 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"cwrap/internal/perm"
 
@@ -104,8 +106,20 @@ func loadFile(path string) (*perm.Permissions, error) {
 		}
 		return nil, fmt.Errorf("读取配置 %s: %w", path, err)
 	}
-	if err := toml.Unmarshal(data, p); err != nil {
-		return nil, fmt.Errorf("解析配置 %s: %w", path, err)
+	// 严格模式：未知字段报错。toml 默认静默忽略未知键，
+	// 拼错的键名会静默失效，排查困难（用 MetaData.Undecoded 检查，
+	// BurntSushi/toml v1.4 无 DisallowUnknownFields）。
+	dec := toml.NewDecoder(bytes.NewReader(data))
+	md, derr := dec.Decode(p)
+	if derr != nil {
+		return nil, fmt.Errorf("解析配置 %s: %w", path, derr)
+	}
+	if undecoded := md.Undecoded(); len(undecoded) > 0 {
+		keys := make([]string, 0, len(undecoded))
+		for _, k := range undecoded {
+			keys = append(keys, k.String())
+		}
+		return nil, fmt.Errorf("配置 %s 含未知字段: %s", path, strings.Join(keys, ", "))
 	}
 	return p, nil
 }

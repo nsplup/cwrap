@@ -422,7 +422,8 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		addr, aerr := dbusproxy.SessionAddress()
 		if aerr == nil {
 			sessionProxy, aerr = dbusproxy.Start(prog.BwrapCmd(), prog.DBusProxyCmd(), addr,
-				filepath.Join(dir, "session"), spec.DBus, []byte(flatpakInfoContent), logw)
+				filepath.Join(dir, "session"), append(append([]string{}, spec.DBus...), spec.RawDBus...),
+				[]byte(flatpakInfoContent), logw)
 		}
 		if aerr != nil {
 			fail("%v", aerr)
@@ -436,7 +437,8 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 			return
 		}
 		sp, aerr := dbusproxy.Start(prog.BwrapCmd(), prog.DBusProxyCmd(), addr,
-			filepath.Join(dir, "system"), spec.DBus, []byte(flatpakInfoContent), logw)
+			filepath.Join(dir, "system"), append(append([]string{}, spec.DBus...), spec.RawDBus...),
+			[]byte(flatpakInfoContent), logw)
 		if aerr != nil {
 			fail("%v", aerr)
 			return
@@ -611,6 +613,7 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 	sandboxPID := -1
 	if infoFD > 0 {
 		pid, rerr := readSandboxPID(netInfoR)
+		netInfoR.Close() // 读端用后即关：daemon 长驻，否则每次运行泄漏一个 fd
 		if rerr != nil {
 			killGroupSafe(entry, syscall.SIGKILL)
 			cmd.Wait()
@@ -903,6 +906,7 @@ func startNetBackend(backend string, pid int, extraArgs []string, readyR *os.Fil
 		return nil, err
 	}
 	if readyR != nil {
+		defer readyR.Close() // 读端用后即关
 		// 等待 slirp4netns 就绪信号（超时 5s）
 		readyR.SetReadDeadline(time.Now().Add(5 * time.Second))
 		buf := make([]byte, 1)

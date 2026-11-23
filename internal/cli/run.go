@@ -23,8 +23,15 @@ import (
 )
 
 // flagPerm 解析 run/permission 共用的权限 FLAG。
-// 返回 -- 之后的剩余命令行、是否 --no-global。
-func flagPerm(args []string) (*perm.Permissions, []string, bool, bool, bool, error) {
+// 返回（-- 之后的剩余命令行、-- 前收集的位置参数（permission 的 APP）、
+// 是否 --no-global）。
+//
+// flag 包遇第一个位置参数即停止解析，因此：先按 "--" 预分割（run 的
+// 命令部分原样保留，绝不二次解析），再对 FLAG 部分循环解析——每轮
+// Parse 停止后把首个位置参数挪出继续，直到耗尽。这使
+// "permission export APP --fs rw:/x"（APP 后置 FLAG）与
+// "permission export --fs rw:/x APP"（FLAG 后置 APP）两种写法都正确。
+func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool, bool, error) {
 	p := &perm.Permissions{}
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -62,8 +69,31 @@ func flagPerm(args []string) (*perm.Permissions, []string, bool, bool, bool, err
 	noGlobal := fs.Bool("no-global", false, "跳过全局配置合并（global.toml）")
 	persist := fs.Bool("persist", false, "保存授权为应用配置")
 	dry := fs.Bool("dry-run", false, "只打印 bwrap 命令行")
-	if err := fs.Parse(args); err != nil {
-		return nil, nil, false, false, false, err
+	splitIdx := -1
+	for i, a := range args {
+		if a == "--" {
+			splitIdx = i
+			break
+		}
+	}
+	var flagArgs, rest []string
+	if splitIdx >= 0 {
+		flagArgs, rest = args[:splitIdx], args[splitIdx+1:]
+	} else {
+		flagArgs = args
+	}
+	// 循环解析：挪出位置参数（permission 的 APP）后继续，直到耗尽。
+	var positional []string
+	for {
+		if err := fs.Parse(flagArgs); err != nil {
+			return nil, nil, nil, false, false, false, err
+		}
+		rem := fs.Args()
+		if len(rem) == 0 {
+			break
+		}
+		positional = append(positional, rem[0])
+		flagArgs = rem[1:]
 	}
 	deny := func(list strSlice) strSlice {
 		out := strSlice{}
@@ -85,7 +115,7 @@ func flagPerm(args []string) (*perm.Permissions, []string, bool, bool, bool, err
 	p.UnsetEnv = unsetEnv
 	p.RawBwrap = rawBwrap
 	p.RawDBus = rawDBus
-	return p, fs.Args(), *noGlobal, *persist, *dry, nil
+	return p, rest, positional, *noGlobal, *persist, *dry, nil
 }
 
 // mergeFlags 把 FLAG 值合并到配置合并结果上：
@@ -125,7 +155,7 @@ func mergeFlags(base *perm.Permissions, f *perm.Permissions) *perm.Permissions {
 }
 
 func cmdRun(argv []string) int {
-	flags, rest, noGlobal, persist, dry, err := flagPerm(argv)
+	flags, rest, _, noGlobal, persist, dry, err := flagPerm(argv)
 	if err != nil {
 		return 2
 	}
@@ -359,7 +389,7 @@ func cmdPermission(argv []string) int {
 	sub, rest := argv[0], argv[1:]
 	switch sub {
 	case "show":
-		flags, restPos, noGlobal, _, _, err := flagPerm(rest)
+		flags, _, restPos, noGlobal, _, _, err := flagPerm(rest)
 		if err != nil {
 			return 2
 		}
@@ -395,13 +425,13 @@ func cmdPermission(argv []string) int {
 			fmt.Fprintln(os.Stderr, "用法: cwrap permission export APP [FLAGS...]")
 			return 2
 		}
-		flags, _, noGlobal, _, _, err := flagPerm(rest)
+		flags, _, positional, noGlobal, _, _, err := flagPerm(rest)
 		if err != nil {
 			return 2
 		}
 		name := flags.App
-		if name == "" && len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
-			name = rest[0]
+		if name == "" && len(positional) > 0 {
+			name = positional[0]
 		}
 		if name == "" {
 			fmt.Fprintln(os.Stderr, "错误: 需要 APP 名或 --app FLAG")

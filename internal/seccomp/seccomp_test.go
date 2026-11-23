@@ -8,6 +8,63 @@ import (
 )
 
 // 验证生成的 BPF 程序长度对齐且结构合法。
+func TestAllowSetHighCritical(t *testing.T) {
+	// 关键调用必须存在（futex 缺失曾导致多线程程序在 high 档死锁）
+	for _, want := range []string{
+		"exit_group", "futex", "prlimit64", "getrlimit", "restart_syscall",
+		"mlock2", "pidfd_send_signal", "fchmodat2",
+	} {
+		if !inStrList(allowSetHigh, want) {
+			t.Fatalf("high 白名单缺少关键调用 %q", want)
+		}
+	}
+	// W^X 三调用必须不在静态白名单（由 genAllow 的检查路径处理），
+	// 否则 emitWXChecks 不可达、W^X 保护失效
+	for _, bad := range []string{"mmap", "mprotect", "pkey_mprotect"} {
+		if inStrList(allowSetHigh, bad) {
+			t.Fatalf("W^X 调用 %q 不应在静态白名单中", bad)
+		}
+	}
+}
+
+func TestGenerateHighWXShape(t *testing.T) {
+	prog, err := Generate("high", nil, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prog) == 0 || len(prog)%8 != 0 {
+		t.Fatalf("非法 BPF 长度 %d", len(prog))
+	}
+	// 存在两条 retAllow（W^X 通过链尾 + 白名单放行）与默认拒绝 EPERM
+	var allows, eperm int
+	for i := 0; i+8 <= len(prog); i += 8 {
+		if prog[i] == 0x06 { // BPF_RET
+			k := uint32(prog[i+4]) | uint32(prog[i+5])<<8 | uint32(prog[i+6])<<16 | uint32(prog[i+7])<<24
+			switch k {
+			case 0x7fff0000:
+				allows++
+			case 0x00050001: // EPERM
+				eperm++
+			}
+		}
+	}
+	if allows < 2 {
+		t.Fatalf("W^X 通过链尾的放行 ret 缺失（allows=%d）", allows)
+	}
+	if eperm < 1 {
+		t.Fatal("默认拒绝 EPERM 缺失")
+	}
+}
+
+func inStrList(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 func TestGenerateShape(t *testing.T) {
 	for _, level := range []string{"low", "medium", "high"} {
 		b, err := Generate(level, []string{"memfd_create"}, false, false)

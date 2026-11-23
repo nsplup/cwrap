@@ -42,6 +42,10 @@ func main() {
 	}
 
 	// 安装测试: seccompcheck /tmp/prog.bpf
+	if len(os.Args) < 2 {
+		fmt.Println("用法: seccompcheck <prog.bpf>  |  seccompcheck generate <low|medium|high> <out.bpf>")
+		os.Exit(2)
+	}
 	prog, err := os.ReadFile(os.Args[1])
 	if err != nil {
 		panic(err)

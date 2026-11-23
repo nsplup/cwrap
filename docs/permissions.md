@@ -94,6 +94,13 @@ public-share/templates/videos`；尾缀 `?` 表示目标不存在不报错
 | `--dbus-arg` | bubblejail `debug.raw_dbus_args` | 原样追加 xdg-dbus-proxy 参数 |
 | `--unset-env` | Flatpak `--unset-env` | 与 `--clearenv` 叠加时为幂等兼容语义 |
 
+## FS 规则
+
+- `--fs` 的关键字锚点展开（`~`、`home`、`xdg-*`）**禁止上溯出锚点目录**
+  （如 `xdg-run/../`、`~/../`）：上溯等价于未经声明的全盘授权，需要时请
+  用绝对路径显式授权；绝对路径允许，但归一化后指向 `/` 的写法（如
+  `rw:/usr/../`）会被根目录禁令拒绝。
+
 ## seccomp
 
 - `low`：仅内核级高危黑名单（bpf/kexec/模块/swap/reboot 等）。
@@ -131,6 +138,13 @@ public-share/templates/videos`；尾缀 `?` 表示目标不存在不报错
   均可提供）。
 - 代理 socket 写入 `$XDG_RUNTIME_DIR/cwrap/<时间戳>/session|system`，
   结束后由 cwrapd 清理；沙箱内地址固定 `/run/cwrap/sessionBus|systemBus`。
+- `--socket gpg-agent` 仅**只读**绑定具体 agent socket 文件
+  （`S.gpg-agent`、`S.gpg-agent.extra`、`S.gpg-agent.ssh`，对齐 flatpak
+  `flatpak-run-sockets.c`）；沙箱无法写宿主 gnupg 目录。
+- `--dbus-arg` / `raw_dbus`：原样透传 xdg-dbus-proxy 参数（调试用），
+  同时作用于 session 与 system 两个代理；非法值由 xdg-dbus-proxy 报错。
+- 已知边界：基线只读挂载 `/etc` 会向沙箱暴露宿主敏感文件
+  （如 `/etc/shadow` 哈希），与 flatpak/bubblejail 语义一致。
 
 ## 已知限制
 

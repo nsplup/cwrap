@@ -39,8 +39,13 @@ func TestGpgAgent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !argHas(a, "--bind-try", "/run/user/1000/gnupg", "/run/user/1000/gnupg") {
-		t.Fatalf("gpg-agent runtime socket bind 缺失")
+	// 对齐 flatpak：仅只读绑定具体 agent socket 文件（目录不可写）
+	if !argHas(a, "--ro-bind-try", "/run/user/1000/gnupg/S.gpg-agent", "/run/user/1000/gnupg/S.gpg-agent") ||
+		!argHas(a, "--ro-bind-try", "/run/user/1000/gnupg/S.gpg-agent.extra", "/run/user/1000/gnupg/S.gpg-agent.extra") {
+		t.Fatalf("gpg-agent 只读 socket 绑定缺失")
+	}
+	if argHas(a, "--bind-try", "/run/user/1000/gnupg", "/run/user/1000/gnupg") {
+		t.Fatalf("gnupg 目录不应再以读写方式挂载（沙箱可删除/替换 agent socket）")
 	}
 }
 

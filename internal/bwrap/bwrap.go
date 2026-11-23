@@ -229,10 +229,14 @@ func Args(o *Options) ([]string, error) {
 		}
 	}
 	if perm.Has(p.Socket, "gpg-agent") {
-		// 对齐 flatpak --socket=gpg-agent：共享 agent socket 与 ~/.gnupg（只读）
+		// 对齐 flatpak --socket=gpg-agent（flatpak-run-sockets.c）：仅只读
+		// 绑定具体 agent socket 文件。ro-bind 不影响 unix socket connect，
+		// 但沙箱无法写宿主 gnupg 目录（不能删除/替换 agent socket）。
 		rt := xdgRuntimeDir(uid)
 		a = append(a, "--dir", filepath.Join(rtIn, "gnupg"))
-		a = append(a, "--bind-try", filepath.Join(rt, "gnupg"), filepath.Join(rtIn, "gnupg"))
+		for _, sock := range []string{"S.gpg-agent", "S.gpg-agent.extra", "S.gpg-agent.ssh"} {
+			a = append(a, "--ro-bind-try", filepath.Join(rt, "gnupg", sock), filepath.Join(rtIn, "gnupg", sock))
+		}
 		if gh, err := os.UserHomeDir(); err == nil {
 			a = append(a, "--ro-bind-try", filepath.Join(gh, ".gnupg"), filepath.Join(homeMount, ".gnupg"))
 		}
@@ -349,11 +353,13 @@ func Args(o *Options) ([]string, error) {
 	}
 	a = append(a, "--setenv", "HOME", homeMount)
 	a = append(a, "--setenv", "XDG_RUNTIME_DIR", rtIn)
+	// 输入法预设环境（对齐 bubblejail ibus/fcitx 服务）。
+	// 必须在 sockEnv 输出循环**之前**写入——此前写在循环之后，
+	// 导致 IM 环境变量从未被注入。
+	applyIMEnv(p, sockEnv)
 	for k, v := range sockEnv {
 		a = append(a, "--setenv", k, v)
 	}
-	// 输入法预设环境（对齐 bubblejail ibus/fcitx 服务）
-	applyIMEnv(p, sockEnv)
 	for _, e := range p.Env {
 		k, v, ok := strings.Cut(e, "=")
 		if !ok || k == "" {
@@ -438,7 +444,7 @@ func driArgs() []string {
 		a = append(a, "--perms", "0755", "--dir", "/sys/class/drm")
 		for _, e := range entries {
 			tgt, err := os.Readlink(filepath.Join("/sys/class/drm", e.Name()))
-			if err != nil || !filepath.IsAbs(tgt) && !isRelativeLink(tgt) {
+			if err != nil || !filepath.IsAbs(tgt) && !strings.HasPrefix(tgt, ".") {
 				continue
 			}
 			a = append(a, "--symlink", tgt, filepath.Join("/sys/class/drm", e.Name()))
@@ -498,10 +504,6 @@ func sortStrings(s []string) {
 			s[j], s[j-1] = s[j-1], s[j]
 		}
 	}
-}
-
-func isRelativeLink(tgt string) bool {
-	return strings.HasPrefix(tgt, ".") || strings.HasPrefix(tgt, "/")
 }
 
 // rootSymlinks 依据宿主形态生成 /bin /sbin /lib /lib64 的符号链接参数。

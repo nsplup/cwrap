@@ -13,6 +13,12 @@
 依赖运行时：`bwrap`（必装）、`xdg-dbus-proxy`（仅使用 D-Bus 权限时需要）。
 无需 root（bubblewrap 走非特权 user namespace）。
 
+## 依赖与版本要求
+
+- **bubblewrap（bwrap）**：`--allow portal` 的 portal 身份链依赖
+  `--json-status-fd`（**bwrap ≥ 0.9.0**，2024-07 发布）；旧版本下 portal
+  启动会直接报 `Unknown option`。其余功能对版本无特殊要求。
+
 ## 安装
 
 ```sh

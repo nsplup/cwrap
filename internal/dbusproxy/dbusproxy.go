@@ -155,7 +155,7 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 	}
 	// 代理的位置参数与规则经 --args=FD 传入（NUL 分隔）
 	proxyArgsContent := append([]string{addr, socketPath, "--filter"}, mapped...)
-	proxyArgsFile, err := memfdLines("cwrap-dbus-proxy-args", proxyArgsContent)
+	proxyArgsFile, err := memfdArgs("cwrap-dbus-proxy-args", proxyArgsContent)
 	if err != nil {
 		readyR.Close()
 		readyW.Close()
@@ -188,7 +188,7 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 			return nil, ierr
 		}
 		wArgs := dbusProxyWrapperArgs(filepath.Dir(socketPath), 6)
-		wArgsFile, werr := memfdLines("cwrap-bwrap-proxy-args", wArgs)
+		wArgsFile, werr := memfdArgs("cwrap-bwrap-proxy-args", wArgs)
 		if werr != nil {
 			readyR.Close()
 			readyW.Close()
@@ -228,10 +228,10 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 	return pr, nil
 }
 
-// memfdLines 把参数按 NUL 分隔写入 memfd 并回卷偏移（供 --args=FD 读取）。
+// memfdArgs 把参数按 NUL 分隔写入 memfd 并回卷偏移（供 --args=FD 读取）。
 // xdg-dbus-proxy 的 add_args() 按 NUL 分割、尾部 NUL 不产生空参数；
 // cwrap 生成的参数（路径/总线名/规则）本身不含 NUL。
-func memfdLines(name string, lines []string) (*os.File, error) {
+func memfdArgs(name string, lines []string) (*os.File, error) {
 	fd, err := unix.MemfdCreate(name, 0)
 	if err != nil {
 		return nil, fmt.Errorf("memfd_create: %w", err)

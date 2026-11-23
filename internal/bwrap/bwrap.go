@@ -238,28 +238,41 @@ func Args(o *Options) ([]string, error) {
 		}
 	}
 	// 直通逃生门（对齐 flatpak --socket=session-bus/system-bus）：
-	// 不经过 xdg-dbus-proxy 过滤，风险等同共享整条总线
+	// 不经过 xdg-dbus-proxy 过滤，风险等同共享整条总线。
+	//
+	// 若同一总线同时存在代理挂载（o.DBus*Path 非空），则不暴露直通 socket：
+	// 仅靠环境变量把应用指向代理并不足以阻止它直接打开
+	// /run/user/<uid>/bus 或 /run/dbus/system_bus_socket 绕过过滤，
+	// 因此这里直接不 bind，代理成为该总线的唯一入口。
 	if perm.Has(p.Socket, "session-bus") {
-		rt := xdgRuntimeDir(uid)
-		a = append(a, "--bind-try", filepath.Join(rt, "bus"), filepath.Join(rtIn, "bus"))
-		sockEnv["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + filepath.Join(rtIn, "bus")
-		fmt.Fprintln(os.Stderr, "警告: --socket session-bus 为未过滤直通，沙箱内可调用宿主会话总线上的全部服务")
+		if o.DBusSessionPath == "" {
+			rt := xdgRuntimeDir(uid)
+			a = append(a, "--bind-try", filepath.Join(rt, "bus"), filepath.Join(rtIn, "bus"))
+			sockEnv["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + filepath.Join(rtIn, "bus")
+			fmt.Fprintln(os.Stderr, "警告: --socket session-bus 为未过滤直通，沙箱内可调用宿主会话总线上的全部服务")
+		} else {
+			fmt.Fprintln(os.Stderr, "警告: --socket session-bus 与 D-Bus 会话代理同时存在，直通 socket 不会被暴露（以代理为准）")
+		}
 	}
 	if perm.Has(p.Socket, "system-bus") {
-		a = append(a, "--ro-bind-try", "/run/dbus/system_bus_socket", "/run/dbus/system_bus_socket")
-		sockEnv["DBUS_SYSTEM_BUS_ADDRESS"] = "unix:path=/run/dbus/system_bus_socket"
-		fmt.Fprintln(os.Stderr, "警告: --socket system-bus 为未过滤直通，沙箱内可调用宿主系统总线上的全部服务")
+		if o.DBusSystemPath == "" {
+			a = append(a, "--ro-bind-try", "/run/dbus/system_bus_socket", "/run/dbus/system_bus_socket")
+			sockEnv["DBUS_SYSTEM_BUS_ADDRESS"] = "unix:path=/run/dbus/system_bus_socket"
+			fmt.Fprintln(os.Stderr, "警告: --socket system-bus 为未过滤直通，沙箱内可调用宿主系统总线上的全部服务")
+		} else {
+			fmt.Fprintln(os.Stderr, "警告: --socket system-bus 与 D-Bus 系统代理同时存在，直通 socket 不会被暴露（以代理为准）")
+		}
 	}
 
-	// D-Bus 代理 socket 挂载（proxy 优先于直通逃生门）
+	// D-Bus 代理 socket 挂载：同一总线一旦配置代理，直通 socket 已在
+	// 上方被跳过，应用只能通过代理路径访问。
 	if o.DBusSessionPath != "" {
 		a = append(a, "--dir", "/run/cwrap")
 		a = append(a, "--ro-bind", o.DBusSessionPath, "/run/cwrap/sessionBus")
 		sockEnv["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/cwrap/sessionBus"
 	} else if !perm.Has(p.Socket, "session-bus") {
 		// 对齐 flatpak：未授予会话总线时显式设为 "disabled"——
-		// GLib ≥2.80 会静默接受（配合 /.flatpak-info 的 flatpak 语义），
-		// 避免 Chromium 等回退到 autolaunch 拉起 dbus-daemon。
+		// GLib ≥2.80 会静默接受，避免 Chromium 等回退到 autolaunch。
 		sockEnv["DBUS_SESSION_BUS_ADDRESS"] = "disabled"
 	}
 	if o.DBusSystemPath != "" {

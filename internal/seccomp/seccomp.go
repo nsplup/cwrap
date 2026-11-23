@@ -39,6 +39,10 @@ const (
 const (
 	retAllow = 0x7fff0000
 	retErrno = 0x00050000
+
+	// retErrnoZero 表示 SECCOMP_RET_ERRNO 且 errno = 0，
+	// 对被拦截的调用表现为"成功并返回 0"。
+	retErrnoZero = retErrno
 )
 
 const protWriteExec = 0x6 // PROT_WRITE(2) | PROT_EXEC(4)
@@ -314,7 +318,7 @@ func genDeny(deny []string, hardenSync bool) ([]byte, error) {
 	p.emit(Instr{Code: bpfRET, K: retAllow})                                      // 默认放行
 	p.denyInstrAt = p.emit(Instr{Code: bpfRET, K: retErrno | uint32(unix.EPERM)}) // 拒绝
 	if hardenSync {
-		p.syncOKAt = p.emit(Instr{Code: bpfRET, K: retErrno | 0}) // 假装成功（errno 0）
+		p.syncOKAt = p.emit(Instr{Code: bpfRET, K: retErrnoZero}) // 假装成功（errno 0）
 	}
 	p.patch()
 	return pack(p.ins), nil
@@ -343,7 +347,7 @@ func genAllow(allow []string, develOK, hardenSync bool) ([]byte, error) {
 	p.denyInstrAt = p.emit(Instr{Code: bpfRET, K: retErrno | uint32(unix.EPERM)}) // 默认拒绝
 	p.allowInstrAt = p.emit(Instr{Code: bpfRET, K: retAllow})                     // 白名单放行
 	if hardenSync {
-		p.syncOKAt = p.emit(Instr{Code: bpfRET, K: retErrno | 0}) // 假装成功（errno 0）
+		p.syncOKAt = p.emit(Instr{Code: bpfRET, K: retErrnoZero}) // 假装成功（errno 0）
 	}
 	p.patch()
 	return pack(p.ins), nil

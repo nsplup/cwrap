@@ -145,6 +145,119 @@ func TestOverlayList(t *testing.T) {
 	if strings.Join(got, ",") != "a,b" {
 		t.Fatalf("OverlayList 空覆盖异常: %v", got)
 	}
+
+	// 高优先级授权覆盖低优先级否决
+	got = OverlayList([]string{"!dri"}, []string{"dri"})
+	if strings.Join(got, ",") != "dri" {
+		t.Fatalf("高优先级授权应覆盖低优先级否决: %v", got)
+	}
+
+	// 高优先级否决收窄低优先级授权
+	got = OverlayList([]string{"dri"}, []string{"!dri"})
+	if strings.Join(got, ",") != "!dri" {
+		t.Fatalf("高优先级否决应收窄低优先级授权: %v", got)
+	}
+
+	// 其他不同值仍累加去重
+	got = OverlayList([]string{"!dri", "input"}, []string{"dri", "dri"})
+	if strings.Join(got, ",") != "input,dri" {
+		t.Fatalf("不同值应累加: %v", got)
+	}
+
+	// 同层内后项覆盖前项（否决优先于授权）
+	got = OverlayList(nil, []string{"dri", "!dri"})
+	if strings.Join(got, ",") != "!dri" {
+		t.Fatalf("同层否决应优先: %v", got)
+	}
+}
+
+// 分层合并的整体行为：全局 !dri 被应用配置 dri 覆盖，FLAG 否决仍可收窄。
+func TestDenyPriorityAcrossLayers(t *testing.T) {
+	// 全局 device=["!dri"] + 应用配置 device=["dri"] -> ["dri"]
+	m := Default()
+	m.Device = []string{"!dri"}
+	app := Default()
+	app.Device = []string{"dri"}
+	m.Overlay(app)
+
+	flags := Default()
+	flags.Device = nil
+	m.Overlay(flags)
+	m.ApplyDenies()
+	if strings.Join(m.Device, ",") != "dri" {
+		t.Fatalf("应用配置授权应覆盖全局否决: %v", m.Device)
+	}
+
+	// FLAG 否决（更高优先级）仍可收窄配置授权
+	m2 := Default()
+	m2.Device = []string{"dri", "input"}
+	m2.Overlay(func() *Permissions { p := Default(); p.Device = []string{"!dri"}; return p }())
+	m2.ApplyDenies()
+	if strings.Join(m2.Device, ",") != "input" {
+		t.Fatalf("高优先级否决应移除 dri 而保留 input: %v", m2.Device)
+	}
+
+	// 更高优先级层（FLAG 层同理）的授权覆盖低优先级层否决
+	m3 := Default()
+	m3.Device = []string{"!dri"}
+	m3.Overlay(func() *Permissions { p := Default(); p.Device = []string{"dri"}; return p }())
+	m3.ApplyDenies()
+	if strings.Join(m3.Device, ",") != "dri" {
+		t.Fatalf("高优先级授权应覆盖低优先级否决: %v", m3.Device)
+	}
+}
+
+// 否决项的值本身必须合法：--no-* 吞掉后续 FLAG 时应报错而非静默否决。
+func TestValidateDenyValues(t *testing.T) {
+	p := Default()
+	p.Device = []string{"!--dry-run"}
+	if err := p.ValidateDenyValues(); err == nil {
+		t.Fatal("--device 否决非法值应报错")
+	}
+	if err := p.Validate(); err == nil {
+		t.Fatal("Validate 应拒绝非法否决值")
+	}
+
+	ok := Default()
+	ok.Socket = []string{"!x11"}
+	ok.Device = []string{"!dri"}
+	ok.FS = []string{"!ro:/opt/data"}
+	ok.DBus = []string{"!session.talk=org.example.A", "!preset:notify"}
+	ok.Env = []string{"!GTK_THEME=Dark"}
+	if err := ok.ValidateDenyValues(); err != nil {
+		t.Fatalf("合法否决值不应报错: %v", err)
+	}
+
+	for _, bad := range []struct{ name, val string }{
+		{"share", "!--dry-run"}, {"socket", "!nope"}, {"device", "!!x11"},
+		{"allow", "!cheat"}, {"harden", "!nope"},
+		{"fs", "!--dry-run"}, {"fs", "!rw:/"},
+		{"dbus", "!--dry-run"}, {"dbus", "!session.talk="}, {"dbus", "!preset:nope"},
+		{"env", "!--dry-run"}, {"env", "!=VALUE"},
+	} {
+		bp := Default()
+		switch bad.name {
+		case "share":
+			bp.Share = []string{bad.val}
+		case "socket":
+			bp.Socket = []string{bad.val}
+		case "device":
+			bp.Device = []string{bad.val}
+		case "allow":
+			bp.Allow = []string{bad.val}
+		case "harden":
+			bp.Harden = []string{bad.val}
+		case "fs":
+			bp.FS = []string{bad.val}
+		case "dbus":
+			bp.DBus = []string{bad.val}
+		case "env":
+			bp.Env = []string{bad.val}
+		}
+		if err := bp.ValidateDenyValues(); err == nil {
+			t.Fatalf("%s 否决值 %q 应报错", bad.name, bad.val)
+		}
+	}
 }
 
 func TestHomeDirHostFallback(t *testing.T) {

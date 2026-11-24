@@ -102,10 +102,17 @@ run 权限 FLAG（默认全部拒绝，需要什么给什么；--no-* / "!" 前�
   --env KEY=VALUE               注入环境变量（可多次）
   --unset-env NAME              移除环境变量
   --bwrap-arg / --dbus-arg      原样透传 bwrap / xdg-dbus-proxy 参数（调试）
-  --no-share/--no-socket/...    否决已授予的对应权限（对齐 flatpak override）
+  --no-share/--no-socket/...    否决已授予的对应权限（对齐 flatpak override；
+                                否决 FLAG 的值同样会校验合法性）
   --no-global                   跳过全局配置合并（~/.config/cwrap/global.toml）
   --persist                     将本次合并后的授权保存为应用配置
   --dry-run                     只打印 bwrap 命令行，不实际运行
+
+优先级与否决:
+  全局配置 < 应用配置 < 命令行 FLAG；高优先级的授权可覆盖低优先级的否决
+  （全局 device=["!dri"] + 应用 device=["dri"] -> 最终授予 dri），高优先级
+  的否决同样可收窄低优先级的授权。否决只能通过 --no-* FLAG 或配置文件的
+  "!" 前缀表达，授权 FLAG 不接受 "!" 前缀值。
 
 示例:
   cwrap run --app demo --share network --socket x11 -- curl https://example.com

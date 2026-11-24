@@ -95,6 +95,26 @@ func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool,
 		positional = append(positional, rem[0])
 		flagArgs = rem[1:]
 	}
+	// 授权 FLAG 不接受否决值："!" 前缀是否决语义，若授权 FLAG 也接受，
+	// "--device !dri" 会静默变成否决，与授权直觉相悖。否决必须走
+	// --no-* FLAG 或配置文件中的 "!" 前缀写法。
+	for _, g := range []struct {
+		name string
+		list strSlice
+	}{
+		{"--share", share}, {"--socket", socket}, {"--device", device},
+		{"--allow", allow}, {"--fs", fsSpecs}, {"--dbus", dbus},
+		{"--env", env}, {"--allow-syscall", syscalls}, {"--harden", harden},
+		{"--net-arg", netArgs}, {"--unset-env", unsetEnv},
+		{"--bwrap-arg", rawBwrap}, {"--dbus-arg", rawDBus},
+	} {
+		for _, v := range g.list {
+			if strings.HasPrefix(v, "!") {
+				return nil, nil, nil, false, false, false, fmt.Errorf(
+					"无效的 %s 值 %q：授权 FLAG 不能携带否决前缀 \"!\"，请改用对应的 --no-* FLAG 或配置文件写法", g.name, v)
+			}
+		}
+	}
 	deny := func(list strSlice) strSlice {
 		out := strSlice{}
 		for _, v := range list {
@@ -119,8 +139,10 @@ func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool,
 }
 
 // mergeFlags 把 FLAG 值合并到配置合并结果上：
-// 标量字段非空覆盖；列表字段累加并去除完全重复的值。
-func mergeFlags(base *perm.Permissions, f *perm.Permissions) *perm.Permissions {
+// 标量字段非空覆盖；列表字段按优先级规则合并（高优先级授权/否决覆盖
+// 低优先级的相反表态，其余累加去重）。合并后先校验否决值合法性再结算
+// 否决项——否则 --no-* 吞掉后续 FLAG 得到的非法值会被静默当成否决。
+func mergeFlags(base *perm.Permissions, f *perm.Permissions) (*perm.Permissions, error) {
 	m := *base
 	if f.App != "" {
 		m.App = f.App
@@ -150,13 +172,17 @@ func mergeFlags(base *perm.Permissions, f *perm.Permissions) *perm.Permissions {
 	if f.NetBackend != "" {
 		m.NetBackend = f.NetBackend
 	}
+	if err := m.ValidateDenyValues(); err != nil {
+		return nil, err
+	}
 	m.ApplyDenies()
-	return &m
+	return &m, nil
 }
 
 func cmdRun(argv []string) int {
 	flags, rest, _, noGlobal, persist, dry, err := flagPerm(argv)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "权限错误:", err)
 		return 2
 	}
 	if len(rest) == 0 {
@@ -174,7 +200,11 @@ func cmdRun(argv []string) int {
 		appCfg, _ := config.LoadApp(flags.App)
 		merged.Overlay(appCfg)
 	}
-	merged = mergeFlags(merged, flags)
+	merged, err = mergeFlags(merged, flags)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "权限错误:", err)
+		return 2
+	}
 	merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
 	if merged.Tmp == "" {
 		merged.Tmp = perm.DefaultTmp()
@@ -403,7 +433,11 @@ func cmdPermission(argv []string) int {
 		}
 		if name == "" {
 			// show 不带 app 时展示（全局+）FLAG
-			merged = mergeFlags(merged, flags)
+			merged, err = mergeFlags(merged, flags)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "权限错误:", err)
+				return 2
+			}
 			merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
 			if merged.Tmp == "" {
 				merged.Tmp = perm.DefaultTmp()
@@ -412,7 +446,11 @@ func cmdPermission(argv []string) int {
 		} else {
 			appCfg, _ := config.LoadApp(name)
 			merged.Overlay(appCfg)
-			merged = mergeFlags(merged, flags)
+			merged, err = mergeFlags(merged, flags)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "权限错误:", err)
+				return 2
+			}
 			merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
 			if merged.Tmp == "" {
 				merged.Tmp = perm.DefaultTmp()
@@ -442,7 +480,11 @@ func cmdPermission(argv []string) int {
 		if !noGlobal {
 			merged, _ = config.LoadGlobal()
 		}
-		merged = mergeFlags(merged, flags)
+		merged, err = mergeFlags(merged, flags)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "权限错误:", err)
+			return 2
+		}
 		merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
 		if merged.Tmp == "" {
 			merged.Tmp = perm.DefaultTmp()

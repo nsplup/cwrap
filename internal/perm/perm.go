@@ -6,9 +6,14 @@
 // 合并规则（全局配置 -> 应用配置 -> 命令行 FLAG）：
 // 标量字段非空覆盖；列表字段累加并去除完全重复的值。
 //
-// 否决语义（对齐 flatpak override --nosocket 等）：任何列表项支持
-// "!" 前缀（TOML 写 "!x11"，FLAG 提供 --no-share/--no-socket 等），
-// 否决发生在最终合并结果上：被否决的值从列表中整体移除。
+// 否决语义（对齐 flatpak override --nosocket 等）：列表项支持 "!" 前缀
+// （TOML 写 "!x11"，FLAG 提供 --no-share/--no-socket 等），否决发生在
+// 合并结果上：被否决的值从列表中整体移除。
+//
+// 优先级：否决与授权按所在层比较，高优先级层（后合并的层）的表态覆盖
+// 低优先级层——高优先级授权可撤销低优先级否决（如全局 device=["!dri"]
+// 被应用配置 device=["dri"] 覆盖为授予），高优先级否决也可收窄低优先级
+// 授权。同一层内否决优先于授权（后项覆盖前项，最终由 ApplyDenies 结算）。
 package perm
 
 import (
@@ -83,8 +88,9 @@ type Permissions struct {
 	AllowSyscalls []string `toml:"allow_syscalls,omitempty"` // 追加白名单 syscall
 }
 
-// Overlay 把 other 的权限叠加到 p 上（标量非空覆盖，列表累加去重，
-// 不处理否决项——由 ApplyDenies 统一处理）。
+// Overlay 把 other（更高优先级层）的权限叠加到 p 上（标量非空覆盖，
+// 列表按 OverlayList 的优先级规则合并：高优先级授权/否决覆盖低优先级的
+// 相反表态，其余累加去重——否决标记由 ApplyDenies 统一结算）。
 func (p *Permissions) Overlay(other *Permissions) {
 	if other == nil {
 		return
@@ -127,6 +133,11 @@ func Default() *Permissions { return &Permissions{} }
 // denyPrefix 标记列表中的否决项（"!value"）。
 const denyPrefix = "!"
 
+// isDeny 判断列表项是否为否决标记（"!X"）。
+func isDeny(v string) bool {
+	return strings.HasPrefix(v, denyPrefix) && len(v) > len(denyPrefix)
+}
+
 // ApplyDenies 处理全部列表字段的否决项：从最终合并结果中移除被否决的
 // 值（或精确 token），并删除否决标记本身。对齐 flatpak override 的
 // --nosocket/--nofilesystem 等收窄语义。
@@ -155,7 +166,7 @@ func applyDeny(list []string) []string {
 	denied := make(map[string]struct{})
 	kept := make([]string, 0, len(list))
 	for _, v := range list {
-		if strings.HasPrefix(v, denyPrefix) && len(v) > len(denyPrefix) {
+		if isDeny(v) {
 			denied[v[len(denyPrefix):]] = struct{}{}
 			continue
 		}
@@ -174,17 +185,127 @@ func applyDeny(list []string) []string {
 	return Dedupe(out)
 }
 
+// ValidateDenyValues 校验所有否决标记（"!X"）中的 X 本身是合法值。
+// 否决 FLAG（--no-device 等）缺值时会吞掉后续 FLAG（Go flag 对非布尔
+// FLAG 无条件取下一个参数），若不校验否决值，吞进来的 "--dry-run" 等
+// 会被当成一次静默否决而不报错。校验后否决 FLAG 与授权 FLAG 一样在
+// 拿到非法值时报错。同样覆盖配置文件中的 "!" 前缀写法。
+func (p *Permissions) ValidateDenyValues() error {
+	for _, group := range []struct {
+		name   string
+		values []string
+		list   []string
+	}{
+		{"--share", ShareValues, p.Share},
+		{"--socket", SocketValues, p.Socket},
+		{"--device", DeviceValues, p.Device},
+		{"--allow", AllowValues, p.Allow},
+		{"--harden", HardenValues, p.Harden},
+	} {
+		for _, v := range group.list {
+			if !isDeny(v) {
+				continue
+			}
+			inner := v[len(denyPrefix):]
+			if !inList(group.values, inner) {
+				return fmt.Errorf("无效的 %s 否决值 %q（可选：%s）",
+					group.name, inner, strings.Join(group.values, ","))
+			}
+		}
+	}
+	for _, v := range p.FS {
+		if !isDeny(v) {
+			continue
+		}
+		if _, _, err := ParseFS(v[len(denyPrefix):]); err != nil {
+			return fmt.Errorf("无效的 --fs 否决值: %v", err)
+		}
+	}
+	for _, v := range p.DBus {
+		if !isDeny(v) {
+			continue
+		}
+		if err := validateDbusToken(v[len(denyPrefix):]); err != nil {
+			return fmt.Errorf("无效的 --dbus 否决值: %v", err)
+		}
+	}
+	for _, v := range p.Env {
+		if !isDeny(v) {
+			continue
+		}
+		inner := v[len(denyPrefix):]
+		if key, _, found := strings.Cut(inner, "="); !found || key == "" {
+			return fmt.Errorf("无效的 --env 否决值 %q（应为 KEY=VALUE）", inner)
+		}
+	}
+	return nil
+}
+
+// validateDbusToken 校验单个 D-Bus 规则 token（target=NAME 或
+// preset:NAME[=GLOB]）。供 DbusRules 与否决值校验共用。
+func validateDbusToken(tok string) error {
+	if strings.HasPrefix(tok, "preset:") {
+		name, arg, found := strings.Cut(strings.TrimPrefix(tok, "preset:"), "=")
+		if !inList(DBusPresetNames, name) {
+			return fmt.Errorf("未知 --dbus 预设 %q（可选：%s）", name, strings.Join(DBusPresetNames, ","))
+		}
+		if name == "mpris" && (!found || arg == "") {
+			return fmt.Errorf("preset:mpris 需要播放器名 glob（如 preset:mpris=firefox.*）")
+		}
+		return nil
+	}
+	idx := strings.Index(tok, "=")
+	if idx < 0 {
+		return fmt.Errorf("无效的 --dbus 项 %q，期望格式 target=NAME（target ∈ %s）",
+			tok, strings.Join(DBusTargets, "|"))
+	}
+	target, name := tok[:idx], tok[idx+1:]
+	if !inList(DBusTargets, target) {
+		return fmt.Errorf("无效的 --dbus target %q（可选：%s）", target, strings.Join(DBusTargets, "|"))
+	}
+	if name == "" {
+		return fmt.Errorf("--dbus %s 的总线名不能为空", target)
+	}
+	return nil
+}
+
 // ---------- 合并 ----------
 
-// OverlayList 累加两个列表并去除完全重复的值（保持首次出现的顺序）。
+// OverlayList 合并低优先级 base 与高优先级 overlay 两个列表：其余值累加
+// 并去除完全重复项（保持首次出现的顺序）。同值表态按层覆盖：
+//   - overlay 的授权值 "X" 覆盖 base 中的否决标记 "!X"（高优先级授权撤销
+//     低优先级否决，如全局 device=["!dri"] 被应用配置 device=["dri"] 覆盖）；
+//   - overlay 的否决标记 "!X" 移除 base 中的授权值 "X"（高优先级否决收窄
+//     低优先级授权，对齐 flatpak override）。
 func OverlayList(base, overlay []string) []string {
 	if len(overlay) == 0 {
 		return Dedupe(base)
 	}
 	merged := make([]string, 0, len(base)+len(overlay))
 	merged = append(merged, base...)
-	merged = append(merged, overlay...)
-	return Dedupe(merged)
+	for _, v := range overlay {
+		// 移除 base 中与本项表态相反的旧条目，再记录本项表态。
+		if isDeny(v) {
+			merged = removeAll(merged, v[len(denyPrefix):]) // 移除低层授权值
+		} else {
+			merged = removeAll(merged, denyPrefix+v) // 移除低层否决标记
+		}
+		if !inList(merged, v) {
+			merged = append(merged, v)
+		}
+	}
+	return merged
+}
+
+// removeAll 原地移除列表中所有等于 v 的项（调用方持有独立副本，可安全复用底层数组）。
+func removeAll(list []string, v string) []string {
+	out := list[:0]
+	for _, x := range list {
+		if x != v {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // Dedupe 去除列表中完全重复的值，保持首次出现的顺序。
@@ -263,17 +384,11 @@ func (p *Permissions) DbusRules() ([]DbusRule, error) {
 		if strings.HasPrefix(tok, "-") {
 			continue
 		}
+		if err := validateDbusToken(tok); err != nil {
+			return nil, err
+		}
 		idx := strings.Index(tok, "=")
-		if idx < 0 {
-			return nil, fmt.Errorf("无效的 --dbus 项 %q，期望格式 target=NAME（target ∈ %s）", tok, strings.Join(DBusTargets, "|"))
-		}
 		target, name := tok[:idx], tok[idx+1:]
-		if !inList(DBusTargets, target) {
-			return nil, fmt.Errorf("无效的 --dbus target %q（可选：%s）", target, strings.Join(DBusTargets, "|"))
-		}
-		if name == "" {
-			return nil, fmt.Errorf("--dbus %s 的总线名不能为空", target)
-		}
 		rules = append(rules, DbusRule{Target: target, Name: name})
 	}
 	return rules, nil
@@ -376,7 +491,12 @@ func (p *Permissions) FSRules() ([]FSRule, error) {
 
 // Validate 校验整份权限描述。
 func (p *Permissions) Validate() error {
-	// 否决项在校验前结算（含配置文件内的 "!" 前缀写法）
+	// 否决项的值本身必须合法（防止 --no-* 吞掉后续 FLAG 后静默通过）
+	if err := p.ValidateDenyValues(); err != nil {
+		return err
+	}
+
+	// 否决项在校验值域前结算（含配置文件内的 "!" 前缀写法）
 	p.ApplyDenies()
 
 	// 应用名作为配置文件名与 D-Bus app-id 段的来源，禁止路径分隔符等

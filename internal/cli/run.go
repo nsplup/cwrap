@@ -36,7 +36,7 @@ func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool,
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var share, socket, device, allow, fsSpecs, dbus, env, syscalls strSlice
-	var noShare, noSocket, noDevice, noAllow, noFS, noDBus, noEnv strSlice
+	var noShare, noSocket, noDevice, noAllow, noFS, noDBus strSlice
 	var harden, unsetEnv, rawBwrap, rawDBus strSlice
 	var netArgs strSlice
 	fs.StringVar(&p.App, "app", "", "应用名（可省略，省略时 HOME 默认 $HOME/.var/sandbox/home）")
@@ -58,7 +58,6 @@ func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool,
 	fs.Var(&noAllow, "no-allow", "否决已授予的 allow 值")
 	fs.Var(&noFS, "no-fs", "否决已授予的 fs 项（按 ro:/path 原文精确匹配）")
 	fs.Var(&noDBus, "no-dbus", "否决已授予的 dbus 规则/预设")
-	fs.Var(&noEnv, "no-env", "否决已授予的 env 项")
 	// bubblejail 对齐扩展
 	fs.Var(&harden, "harden", "加固: namespaces（递归封死沙箱内建 namespace）,sync（屏蔽落盘 syscall）")
 	fs.StringVar(&p.NetBackend, "net-backend", "", "网络后端: host(默认)|pasta|slirp4netns")
@@ -96,22 +95,31 @@ func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool,
 		flagArgs = rem[1:]
 	}
 	// 授权 FLAG 不接受否决值："!" 前缀是否决语义，若授权 FLAG 也接受，
-	// "--device !dri" 会静默变成否决，与授权直觉相悖。否决必须走
-	// --no-* FLAG 或配置文件中的 "!" 前缀写法。
+	// "--device !dri" 会静默变成否决，与授权直觉相悖。否决必须走对应
+	// 的否决通道（--no-* FLAG、--unset-env 或配置文件 "!" 前缀）。
 	for _, g := range []struct {
 		name string
 		list strSlice
+		hint string // 提示正确的否决通道
 	}{
-		{"--share", share}, {"--socket", socket}, {"--device", device},
-		{"--allow", allow}, {"--fs", fsSpecs}, {"--dbus", dbus},
-		{"--env", env}, {"--allow-syscall", syscalls}, {"--harden", harden},
-		{"--net-arg", netArgs}, {"--unset-env", unsetEnv},
-		{"--bwrap-arg", rawBwrap}, {"--dbus-arg", rawDBus},
+		{"--share", share, "请改用对应的 --no-share FLAG 或配置文件写法"},
+		{"--socket", socket, "请改用对应的 --no-socket FLAG 或配置文件写法"},
+		{"--device", device, "请改用对应的 --no-device FLAG 或配置文件写法"},
+		{"--allow", allow, "请改用对应的 --no-allow FLAG 或配置文件写法"},
+		{"--fs", fsSpecs, "请改用对应的 --no-fs FLAG 或配置文件写法"},
+		{"--dbus", dbus, "请改用对应的 --no-dbus FLAG 或配置文件写法"},
+		{"--env", env, "请改用 --unset-env FLAG 或配置文件写法"},
+		{"--allow-syscall", syscalls, "请使用配置文件的 \"!\" 前缀写法"},
+		{"--harden", harden, "请使用配置文件的 \"!\" 前缀写法"},
+		{"--net-arg", netArgs, "请使用配置文件的 \"!\" 前缀写法"},
+		{"--unset-env", unsetEnv, "请使用配置文件的 \"!\" 前缀写法"},
+		{"--bwrap-arg", rawBwrap, "请使用配置文件的 \"!\" 前缀写法"},
+		{"--dbus-arg", rawDBus, "请使用配置文件的 \"!\" 前缀写法"},
 	} {
 		for _, v := range g.list {
 			if strings.HasPrefix(v, "!") {
 				return nil, nil, nil, false, false, false, fmt.Errorf(
-					"无效的 %s 值 %q：授权 FLAG 不能携带否决前缀 \"!\"，请改用对应的 --no-* FLAG 或配置文件写法", g.name, v)
+					"无效的 %s 值 %q：授权 FLAG 不能携带否决前缀 \"!\"，%s", g.name, v, g.hint)
 			}
 		}
 	}
@@ -128,7 +136,9 @@ func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool,
 	p.Allow = append(allow, deny(noAllow)...)
 	p.FS = append(fsSpecs, deny(noFS)...)
 	p.DBus = append(dbus, deny(noDBus)...)
-	p.Env = append(env, deny(noEnv)...)
+	// env 的否决由 --unset-env（按变量名移除）承担，--no-env 已移除；
+	// 配置文件的 "!KEY=VALUE" 写法仍受支持并由 ValidateDenyValues 校验。
+	p.Env = env
 	p.AllowSyscalls = syscalls
 	p.Harden = harden
 	p.NetBackendArgs = netArgs

@@ -15,13 +15,16 @@ cwrap 的权限语义对齐 Flatpak 与 bubblejail，表达更直白：**默认�
 列表字段（share/socket/device/allow/fs/dbus/env/allow_syscalls/harden/
 net_backend_args/unset_env/raw_bwrap/raw_dbus）累加并去重。
 
-**否决语义**（对齐 `flatpak override --nosocket` 等）：任何列表项支持
-`!` 前缀（TOML 写 `"!x11"`），或使用 `--no-share/--no-socket/--no-device/
---no-allow/--no-fs/--no-dbus` FLAG；环境变量按变量名移除统一走
-`--unset-env` / `unset_env`（`--no-env` 已移除，与 `--unset-env` 重复）。
-否决作用于合并结果：被否决的值从授权列表中整体移除。否决项的值同样会
-校验合法性——`--no-*` FLAG 吞到非法值（如误吞后续 FLAG）时会直接报错
-而非静默否决。
+**否决语义**（对齐 `flatpak override` 的 `--nosocket`/`--nofilesystem` 等
+命名）：任何列表项支持 `!` 前缀（TOML 写 `"!x11"`），或使用
+`--noshare/--nosocket/--nodevice/--noallow/--nofilesystem/--nodbus` FLAG
+（fs/dbus 否决须逐字重复原授权 token，与 flatpak 相同）；环境变量按变量
+名移除统一走 `--unset-env` / `unset_env`（`--no-env` 已移除，与
+`--unset-env` 重复；env 的 `"!KEY=VALUE"` 写法同样已废弃）。否决作用于
+合并结果：被否决的值从授权列表中整体移除。否决项的值同样会校验合法性
+——否决 FLAG 吞到非法值（如误吞后续 FLAG）时会直接报错而非静默否决；
+否决未命中任何已授权项时会在 stderr 打印警告。旧式
+`--no-share/--no-socket` 等横线写法已移除。
 
 **优先级**：授权与否决按所在层比较，高优先级层（应用配置 > 全局配置、
 命令行 FLAG > 配置文件）的表态覆盖低优先级层——高优先级授权可撤销低

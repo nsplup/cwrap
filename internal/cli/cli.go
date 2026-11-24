@@ -80,7 +80,7 @@ func usageTo(w io.Writer) {
   cwrap daemon                               启动守护进程（通常自动拉起）
   cwrap version | help
 
-授权 FLAG（默认零权限，需要什么给什么）:
+授权 FLAG :
   --app NAME                    应用名（决定 HOME 与配置文件；省略时 HOME 为
                                 $HOME/.var/sandbox/home）
   --home PATH                   自定义沙箱 HOME（默认 $HOME/.var/sandbox/NAME）
@@ -107,10 +107,13 @@ func usageTo(w io.Writer) {
   --net-arg LIST                网络后端附加参数
   --bwrap-arg / --dbus-arg      原样透传 bwrap / xdg-dbus-proxy 参数（调试）
 
-否决 FLAG（对齐 flatpak override --nosocket；否决值同样校验合法性）:
-  --no-share/--no-socket/--no-device/--no-allow/--no-fs/--no-dbus VALUE
+否决 FLAG :
+  --noshare/--nosocket/--nodevice/--noallow VALUE
                                 否决已授予的对应权限
-  --unset-env NAME              按变量名移除环境变量（移除 env 的唯一 FLAG 通道）
+  --nofilesystem SPEC           否决已授予的挂载项（须逐字重复原授权 token，
+                                如 --nofilesystem ro:/opt/data）
+  --nodbus SPEC                 否决已授予的 D-Bus 规则/预设（须逐字重复原 token）
+  --unset-env NAME              按变量名移除环境变量
 
 配置与其他:
   --no-global                   跳过全局配置合并（~/.config/cwrap/global.toml）
@@ -121,8 +124,8 @@ func usageTo(w io.Writer) {
   全局配置 < 应用配置 < 命令行 FLAG；高优先级的授权可覆盖低优先级的否决
   （全局 device=["!dri"] + 应用 device=["dri"] -> 最终授予 dri），高优先级
   的否决同样可收窄低优先级的授权；同一层内否决优先于授权。否决只能通过
-  --no-* FLAG、--unset-env 或配置文件的 "!" 前缀表达；授权 FLAG 不接受
-  "!" 前缀值。
+  --nosocket 等 flatpak 风格否决 FLAG、--unset-env 或配置文件的 "!" 前缀
+  表达；授权 FLAG 不接受 "!" 前缀值。
 
 示例:
   cwrap run --app demo --share network --socket x11 -- curl https://example.com

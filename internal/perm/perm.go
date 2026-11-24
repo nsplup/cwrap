@@ -138,30 +138,53 @@ func isDeny(v string) bool {
 	return strings.HasPrefix(v, denyPrefix) && len(v) > len(denyPrefix)
 }
 
-// ApplyDenies 处理全部列表字段的否决项：从最终合并结果中移除被否决的
-// 值（或精确 token），并删除否决标记本身。对齐 flatpak override 的
-// --nosocket/--nofilesystem 等收窄语义。
+// ApplyDenies 处理列表字段的否决项：从最终合并结果中移除被否决的值（或
+// 精确 token），并删除否决标记本身。对齐 flatpak override 的
+// --nosocket/--nofilesystem 等收窄语义。不关心未命中警告时使用本方法。
 func (p *Permissions) ApplyDenies() {
-	p.Share = applyDeny(p.Share)
-	p.Socket = applyDeny(p.Socket)
-	p.Device = applyDeny(p.Device)
-	p.Allow = applyDeny(p.Allow)
-	p.FS = applyDeny(p.FS)
-	p.Env = applyDeny(p.Env)
-	p.DBus = applyDeny(p.DBus)
-	p.AllowSyscalls = applyDeny(p.AllowSyscalls)
-	p.Harden = applyDeny(p.Harden)
-	p.NetBackendArgs = applyDeny(p.NetBackendArgs)
-	p.UnsetEnv = applyDeny(p.UnsetEnv)
-	p.RawBwrap = applyDeny(p.RawBwrap)
-	p.RawDBus = applyDeny(p.RawDBus)
+	p.ApplyDeniesWarned()
 }
 
-// applyDeny 返回移除否决项后的列表。
-// 规则：收集所有 "!X"，然后从列表中同时移除 "!X" 标记与精确匹配的 X。
-func applyDeny(list []string) []string {
+// ApplyDeniesWarned 同 ApplyDenies，但返回"否决未命中"警告：某否决值
+// 未移除任何已授权项时（拼写/格式与原授权 token 不一致），静默 no-op
+// 是最危险的陷阱，此处显式产出警告，由调用方打印到 stderr。env 字段
+// 不参与否决（按变量名移除统一走 unset_env，见 ValidateDenyValues）。
+func (p *Permissions) ApplyDeniesWarned() []string {
+	var warns []string
+	var ws []string
+	p.Share, ws = applyDenyWarned(p.Share, "--noshare")
+	warns = append(warns, ws...)
+	p.Socket, ws = applyDenyWarned(p.Socket, "--nosocket")
+	warns = append(warns, ws...)
+	p.Device, ws = applyDenyWarned(p.Device, "--nodevice")
+	warns = append(warns, ws...)
+	p.Allow, ws = applyDenyWarned(p.Allow, "--noallow")
+	warns = append(warns, ws...)
+	p.FS, ws = applyDenyWarned(p.FS, "--nofilesystem")
+	warns = append(warns, ws...)
+	p.DBus, ws = applyDenyWarned(p.DBus, "--nodbus")
+	warns = append(warns, ws...)
+	p.AllowSyscalls, ws = applyDenyWarned(p.AllowSyscalls, "allow_syscalls")
+	warns = append(warns, ws...)
+	p.Harden, ws = applyDenyWarned(p.Harden, "harden")
+	warns = append(warns, ws...)
+	p.NetBackendArgs, ws = applyDenyWarned(p.NetBackendArgs, "net_backend_args")
+	warns = append(warns, ws...)
+	p.UnsetEnv, ws = applyDenyWarned(p.UnsetEnv, "unset_env")
+	warns = append(warns, ws...)
+	p.RawBwrap, ws = applyDenyWarned(p.RawBwrap, "raw_bwrap")
+	warns = append(warns, ws...)
+	p.RawDBus, ws = applyDenyWarned(p.RawDBus, "raw_dbus")
+	warns = append(warns, ws...)
+	return warns
+}
+
+// applyDenyWarned 返回移除否决项后的列表与未命中警告。
+// 规则：收集所有 "!X"，然后从列表中同时移除 "!X" 标记与精确匹配的 X；
+// 某 X 一个已授权项都没移除时产出一条警告（拼写/格式不一致会静默失效）。
+func applyDenyWarned(list []string, what string) ([]string, []string) {
 	if len(list) == 0 {
-		return list
+		return list, nil
 	}
 	denied := make(map[string]struct{})
 	kept := make([]string, 0, len(list))
@@ -173,7 +196,7 @@ func applyDeny(list []string) []string {
 		kept = append(kept, v)
 	}
 	if len(denied) == 0 {
-		return kept
+		return kept, nil
 	}
 	out := make([]string, 0, len(kept))
 	for _, v := range kept {
@@ -182,11 +205,21 @@ func applyDeny(list []string) []string {
 		}
 		out = append(out, v)
 	}
-	return Dedupe(out)
+	// 未命中 = 否决的 X 在已授权项 kept 中根本不存在（拼写/格式不一致）
+	var warns []string
+	for x := range denied {
+		if !inList(kept, x) {
+			warns = append(warns, fmt.Sprintf(
+				"警告: %s 否决 %q 未命中任何已授权项（否决需逐字重复原授权 token，请检查拼写与格式）",
+				what, x))
+		}
+	}
+	sort.Strings(warns)
+	return Dedupe(out), warns
 }
 
 // ValidateDenyValues 校验所有否决标记（"!X"）中的 X 本身是合法值。
-// 否决 FLAG（--no-device 等）缺值时会吞掉后续 FLAG（Go flag 对非布尔
+// 否决 FLAG（--nodevice 等）缺值时会吞掉后续 FLAG（Go flag 对非布尔
 // FLAG 无条件取下一个参数），若不校验否决值，吞进来的 "--dry-run" 等
 // 会被当成一次静默否决而不报错。校验后否决 FLAG 与授权 FLAG 一样在
 // 拿到非法值时报错。同样覆盖配置文件中的 "!" 前缀写法。
@@ -196,11 +229,11 @@ func (p *Permissions) ValidateDenyValues() error {
 		values []string
 		list   []string
 	}{
-		{"--share", ShareValues, p.Share},
-		{"--socket", SocketValues, p.Socket},
-		{"--device", DeviceValues, p.Device},
-		{"--allow", AllowValues, p.Allow},
-		{"--harden", HardenValues, p.Harden},
+		{"--noshare", ShareValues, p.Share},
+		{"--nosocket", SocketValues, p.Socket},
+		{"--nodevice", DeviceValues, p.Device},
+		{"--noallow", AllowValues, p.Allow},
+		{"harden", HardenValues, p.Harden},
 	} {
 		for _, v := range group.list {
 			if !isDeny(v) {
@@ -218,7 +251,7 @@ func (p *Permissions) ValidateDenyValues() error {
 			continue
 		}
 		if _, _, err := ParseFS(v[len(denyPrefix):]); err != nil {
-			return fmt.Errorf("无效的 --fs 否决值: %v", err)
+			return fmt.Errorf("无效的 --nofilesystem 否决值: %v", err)
 		}
 	}
 	for _, v := range p.DBus {
@@ -226,16 +259,15 @@ func (p *Permissions) ValidateDenyValues() error {
 			continue
 		}
 		if err := validateDbusToken(v[len(denyPrefix):]); err != nil {
-			return fmt.Errorf("无效的 --dbus 否决值: %v", err)
+			return fmt.Errorf("无效的 --nodbus 否决值: %v", err)
 		}
 	}
+	// env 否决已移除：按变量名移除统一走 unset_env（--unset-env FLAG /
+	// unset_env 配置项），按"值"匹配环境变量过于脆弱（值随版本变化即静默
+	// 失效），且 unset_env 在 bwrap 的 --unset-env 后置语义下严格更强。
 	for _, v := range p.Env {
-		if !isDeny(v) {
-			continue
-		}
-		inner := v[len(denyPrefix):]
-		if key, _, found := strings.Cut(inner, "="); !found || key == "" {
-			return fmt.Errorf("无效的 --env 否决值 %q（应为 KEY=VALUE）", inner)
+		if isDeny(v) {
+			return fmt.Errorf("无效的 env 否决值 %q（env 否决已移除，请使用 unset_env 按变量名移除）", v)
 		}
 	}
 	return nil
@@ -275,8 +307,9 @@ func validateDbusToken(tok string) error {
 // 并去除完全重复项（保持首次出现的顺序）。同值表态按层覆盖：
 //   - overlay 的授权值 "X" 覆盖 base 中的否决标记 "!X"（高优先级授权撤销
 //     低优先级否决，如全局 device=["!dri"] 被应用配置 device=["dri"] 覆盖）；
-//   - overlay 的否决标记 "!X" 移除 base 中的授权值 "X"（高优先级否决收窄
-//     低优先级授权，对齐 flatpak override）。
+//   - overlay 的否决标记 "!X" 直接叠加，base 中的授权值 "X" 由
+//     ApplyDeniesWarned 统一移除（高优先级否决收窄低优先级授权，对齐
+//     flatpak override）——这样否决"命中"发生在结算层，未命中警告才准确。
 func OverlayList(base, overlay []string) []string {
 	if len(overlay) == 0 {
 		return Dedupe(base)
@@ -284,11 +317,9 @@ func OverlayList(base, overlay []string) []string {
 	merged := make([]string, 0, len(base)+len(overlay))
 	merged = append(merged, base...)
 	for _, v := range overlay {
-		// 移除 base 中与本项表态相反的旧条目，再记录本项表态。
-		if isDeny(v) {
-			merged = removeAll(merged, v[len(denyPrefix):]) // 移除低层授权值
-		} else {
-			merged = removeAll(merged, denyPrefix+v) // 移除低层否决标记
+		if !isDeny(v) {
+			// 高优先级授权撤销低优先级层的否决标记
+			merged = removeAll(merged, denyPrefix+v)
 		}
 		if !inList(merged, v) {
 			merged = append(merged, v)

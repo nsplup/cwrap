@@ -30,7 +30,7 @@ func TestFlagPermBasic(t *testing.T) {
 	if p.App != "demo" {
 		t.Fatalf("--app 解析失败: %q", p.App)
 	}
-	// flagPerm 阶段仅累加，去重由 OverlayList/ApplyDenies 完成
+	// flagPerm 阶段仅累加，去重由 OverlayList/ApplyDeniesWarned 完成
 	if got := joinList(p.Share); got != "network,ipc,ipc" {
 		t.Fatalf("--share 解析失败: %v", p.Share)
 	}
@@ -63,18 +63,18 @@ func TestFlagPermPositional(t *testing.T) {
 	}
 }
 
-// 否决 FLAG 转换为 "!" 前缀进入对应列表。
+// 否决 FLAG（flatpak 风格命名）转换为 "!" 前缀进入对应列表。
 func TestFlagPermDenyFlags(t *testing.T) {
-	p, _, _, _, _, _ := mustFlagPerm(t, "--device", "dri", "--no-device", "dri",
-		"--no-socket", "x11", "--no-fs", "ro:/opt", "--unset-env", "SECRET")
+	p, _, _, _, _, _ := mustFlagPerm(t, "--device", "dri", "--nodevice", "dri",
+		"--nosocket", "x11", "--nofilesystem", "ro:/opt", "--unset-env", "SECRET")
 	if got := joinList(p.Device); got != "dri,!dri" {
-		t.Fatalf("--no-device 应转为否决标记: %v", p.Device)
+		t.Fatalf("--nodevice 应转为否决标记: %v", p.Device)
 	}
 	if got := joinList(p.Socket); got != "!x11" {
-		t.Fatalf("--no-socket 应转为否决标记: %v", p.Socket)
+		t.Fatalf("--nosocket 应转为否决标记: %v", p.Socket)
 	}
 	if got := joinList(p.FS); got != "!ro:/opt" {
-		t.Fatalf("--no-fs 应转为否决标记: %v", p.FS)
+		t.Fatalf("--nofilesystem 应转为否决标记: %v", p.FS)
 	}
 	if got := joinList(p.UnsetEnv); got != "SECRET" {
 		t.Fatalf("--unset-env 解析失败: %v", p.UnsetEnv)
@@ -82,10 +82,12 @@ func TestFlagPermDenyFlags(t *testing.T) {
 }
 
 // --no-env 已移除：与 --unset-env 重复，应作为未知 FLAG 报错。
-func TestNoEnvFlagRemoved(t *testing.T) {
-	_, _, _, _, _, _, err := flagPerm([]string{"--no-env", "FOO=1"})
-	if err == nil {
-		t.Fatal("--no-env 已移除，应报未知 FLAG 错误")
+// 旧式横线否决写法（--no-device 等）也已移除，改名对齐 flatpak。
+func TestRemovedFlags(t *testing.T) {
+	for _, bad := range []string{"--no-env", "--no-device", "--no-socket", "--no-fs", "--no-dbus", "--no-share", "--no-allow"} {
+		if _, _, _, _, _, _, err := flagPerm([]string{bad, "x"}); err == nil {
+			t.Fatalf("%s 已移除，应报未知 FLAG 错误", bad)
+		}
 	}
 }
 
@@ -95,11 +97,11 @@ func TestAuthFlagRejectsDenyPrefix(t *testing.T) {
 		args []string
 		want string // 错误信息中必须包含的通道提示
 	}{
-		{[]string{"--device", "!dri"}, "--no-device"},
-		{[]string{"--socket", "!x11"}, "--no-socket"},
+		{[]string{"--device", "!dri"}, "--nodevice"},
+		{[]string{"--socket", "!x11"}, "--nosocket"},
 		{[]string{"--env", "!FOO=1"}, "--unset-env"},
 		{[]string{"--unset-env", "!FOO"}, "配置文件"},
-		{[]string{"--fs", "!ro:/opt"}, "--no-fs"},
+		{[]string{"--fs", "!ro:/opt"}, "--nofilesystem"},
 	}
 	for _, c := range cases {
 		_, _, _, _, _, _, err := flagPerm(c.args)
@@ -119,10 +121,13 @@ func TestMergeFlagsPriority(t *testing.T) {
 	base.Device = []string{"!dri"}
 	base.Socket = []string{"x11"}
 
-	flags, _, _, _, _, _ := mustFlagPerm(t, "--device", "dri", "--no-socket", "x11")
-	merged, err := mergeFlags(base, flags)
+	flags, _, _, _, _, _ := mustFlagPerm(t, "--device", "dri", "--nosocket", "x11")
+	merged, warns, err := mergeFlags(base, flags)
 	if err != nil {
 		t.Fatalf("mergeFlags 失败: %v", err)
+	}
+	if len(warns) != 0 {
+		t.Fatalf("命中的否决不应有警告: %v", warns)
 	}
 	if got := joinList(merged.Device); got != "dri" {
 		t.Fatalf("FLAG 授权应覆盖配置否决: %v", merged.Device)
@@ -134,48 +139,80 @@ func TestMergeFlagsPriority(t *testing.T) {
 
 // mergeFlags 在结算否决前校验否决值：吞掉的非法值应报错。
 func TestMergeFlagsRejectsBadDenyValue(t *testing.T) {
-	flags, _, _, _, _, _ := mustFlagPerm(t, "--no-device", "--dry-run")
+	flags, _, _, _, _, _ := mustFlagPerm(t, "--nodevice", "--dry-run")
 	if got := joinList(flags.Device); got != "!--dry-run" {
 		t.Fatalf("否决 FLAG 吞值后应得到否决标记: %v", flags.Device)
 	}
-	if _, err := mergeFlags(perm.Default(), flags); err == nil ||
-		!strings.Contains(err.Error(), `无效的 --device 否决值 "--dry-run"`) {
+	if _, _, err := mergeFlags(perm.Default(), flags); err == nil ||
+		!strings.Contains(err.Error(), `无效的 --nodevice 否决值 "--dry-run"`) {
 		t.Fatalf("否决 FLAG 吞掉后续 FLAG 应报非法否决值: %v", err)
 	}
 
-	flags2, _, _, _, _, _ := mustFlagPerm(t, "--no-fs", "--dry-run")
-	if _, err := mergeFlags(perm.Default(), flags2); err == nil {
-		t.Fatal("--no-fs 吞值应报非法否决值")
+	flags2, _, _, _, _, _ := mustFlagPerm(t, "--nofilesystem", "--dry-run")
+	if _, _, err := mergeFlags(perm.Default(), flags2); err == nil {
+		t.Fatal("--nofilesystem 吞值应报非法否决值")
 	}
 }
 
 // 合法否决值正常通过。
 func TestMergeFlagsValidDeny(t *testing.T) {
-	flags, _, _, _, _, _ := mustFlagPerm(t, "--device", "dri", "--no-device", "dri")
-	merged, err := mergeFlags(perm.Default(), flags)
+	flags, _, _, _, _, _ := mustFlagPerm(t, "--device", "dri", "--nodevice", "dri")
+	merged, warns, err := mergeFlags(perm.Default(), flags)
 	if err != nil {
 		t.Fatalf("mergeFlags 失败: %v", err)
 	}
 	if got := joinList(merged.Device); got != "" {
 		t.Fatalf("同层否决应优先于授权: %v", merged.Device)
 	}
+	if len(warns) != 0 {
+		t.Fatalf("命中的否决不应有警告: %v", warns)
+	}
 }
 
-// help 文本：覆盖新增的优先级/否决说明，且不再出现 --no-env。
+// 否决未命中任何已授权项时，mergeFlags 应产出警告供调用方打印。
+func TestMergeFlagsDenyMissWarns(t *testing.T) {
+	flags, _, _, _, _, _ := mustFlagPerm(t, "--device", "dri", "--nodevice", "input")
+	merged, warns, err := mergeFlags(perm.Default(), flags)
+	if err != nil {
+		t.Fatalf("mergeFlags 失败: %v", err)
+	}
+	if got := joinList(merged.Device); got != "dri" {
+		t.Fatalf("未命中的否决不应移除任何值: %v", merged.Device)
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "--nodevice") ||
+		!strings.Contains(warns[0], `"input"`) {
+		t.Fatalf("未命中的否决应产出警告: %v", warns)
+	}
+}
+
+// env 否决已彻底移除：无论 FLAG 还是配置文件来源都应报错。
+func TestEnvDenyRemoved(t *testing.T) {
+	flags := perm.Default()
+	flags.Env = []string{"A=1", "!A=1"}
+	_, _, err := mergeFlags(perm.Default(), flags)
+	if err == nil || !strings.Contains(err.Error(), "unset_env") {
+		t.Fatalf("env 否决应报错并提示 unset_env: %v", err)
+	}
+}
+
+// help 文本：覆盖 flatpak 风格否决 FLAG 与优先级说明，旧写法不再出现。
 func TestUsageText(t *testing.T) {
 	var buf bytes.Buffer
 	usageTo(&buf)
 	text := buf.String()
 	for _, want := range []string{
 		"用法", "cwrap run [FLAGS] --",
-		"--unset-env NAME", "--no-share", "--no-dbus", "--dry-run",
+		"--unset-env NAME", "--nosocket", "--nofilesystem", "--nodbus",
+		"--noshare", "--noallow", "--dry-run",
 		"优先级与否决", "--unset-env 或配置文件",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help 缺少 %q", want)
 		}
 	}
-	if strings.Contains(text, "--no-env") {
-		t.Fatal("help 不应再出现 --no-env")
+	for _, gone := range []string{"--no-env", "--no-share", "--no-socket", "--no-device", "--no-fs", "--no-dbus"} {
+		if strings.Contains(text, gone) {
+			t.Fatal("help 不应再出现旧式写法 " + gone)
+		}
 	}
 }

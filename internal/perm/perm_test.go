@@ -152,22 +152,22 @@ func TestOverlayList(t *testing.T) {
 		t.Fatalf("高优先级授权应覆盖低优先级否决: %v", got)
 	}
 
-	// 高优先级否决收窄低优先级授权
+	// 高优先级否决叠加为标记对，结算层（ApplyDeniesWarned）移除授权值
 	got = OverlayList([]string{"dri"}, []string{"!dri"})
-	if strings.Join(got, ",") != "!dri" {
-		t.Fatalf("高优先级否决应收窄低优先级授权: %v", got)
+	if strings.Join(got, ",") != "dri,!dri" {
+		t.Fatalf("高优先级否决应叠加标记: %v", got)
 	}
 
-	// 其他不同值仍累加去重
+	// 不同值仍累加去重
 	got = OverlayList([]string{"!dri", "input"}, []string{"dri", "dri"})
 	if strings.Join(got, ",") != "input,dri" {
 		t.Fatalf("不同值应累加: %v", got)
 	}
 
-	// 同层内后项覆盖前项（否决优先于授权）
+	// 同层内否决优先于授权（结算层移除）
 	got = OverlayList(nil, []string{"dri", "!dri"})
-	if strings.Join(got, ",") != "!dri" {
-		t.Fatalf("同层否决应优先: %v", got)
+	if strings.Join(got, ",") != "dri,!dri" {
+		t.Fatalf("同层否决应叠加标记: %v", got)
 	}
 }
 
@@ -207,7 +207,8 @@ func TestDenyPriorityAcrossLayers(t *testing.T) {
 	}
 }
 
-// 否决项的值本身必须合法：--no-* 吞掉后续 FLAG 时应报错而非静默否决。
+// 否决项的值本身必须合法：--nosocket 等否决 FLAG 吞掉后续 FLAG 时应报错
+// 而非静默否决。
 func TestValidateDenyValues(t *testing.T) {
 	p := Default()
 	p.Device = []string{"!--dry-run"}
@@ -223,7 +224,6 @@ func TestValidateDenyValues(t *testing.T) {
 	ok.Device = []string{"!dri"}
 	ok.FS = []string{"!ro:/opt/data"}
 	ok.DBus = []string{"!session.talk=org.example.A", "!preset:notify"}
-	ok.Env = []string{"!GTK_THEME=Dark"}
 	if err := ok.ValidateDenyValues(); err != nil {
 		t.Fatalf("合法否决值不应报错: %v", err)
 	}
@@ -233,7 +233,8 @@ func TestValidateDenyValues(t *testing.T) {
 		{"allow", "!cheat"}, {"harden", "!nope"},
 		{"fs", "!--dry-run"}, {"fs", "!rw:/"},
 		{"dbus", "!--dry-run"}, {"dbus", "!session.talk="}, {"dbus", "!preset:nope"},
-		{"env", "!--dry-run"}, {"env", "!=VALUE"},
+		// env 否决已移除：任何 "!" 前缀项都非法（无论格式对错）
+		{"env", "!--dry-run"}, {"env", "!GTK_THEME=Dark"},
 	} {
 		bp := Default()
 		switch bad.name {
@@ -259,6 +260,36 @@ func TestValidateDenyValues(t *testing.T) {
 		}
 	}
 }
+
+// 否决未命中任何已授权项时必须产出警告（静默失效是最危险的陷阱）。
+func TestApplyDeniesWarned(t *testing.T) {
+	p := Default()
+	p.Device = []string{"dri", "!dri", "!input"} // "!dri" 命中，"!input" 未命中
+	warns := p.ApplyDeniesWarned()
+	if len(p.Device) != 0 {
+		t.Fatalf("命中的否决应移除 dri: %v", p.Device)
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "--nodevice") ||
+		!strings.Contains(warns[0], `"input"`) {
+		t.Fatalf("未命中的否决应产出警告: %v", warns)
+	}
+
+	// 全部命中时无警告；env 不再参与否决结算
+	ok := Default()
+	ok.Socket = []string{"x11", "!x11", "wayland"}
+	ok.Env = []string{"A=1"}
+	if warns := ok.ApplyDeniesWarned(); len(warns) != 0 {
+		t.Fatalf("全部命中不应有警告: %v", warns)
+	}
+	if !Has(ok.Socket, "wayland") || Has(ok.Socket, "x11") {
+		t.Fatalf("socket 否决结算异常: %v", ok.Socket)
+	}
+	if join(ok.Env) != "A=1" {
+		t.Fatalf("env 不应参与否决结算: %v", ok.Env)
+	}
+}
+
+func join(l []string) string { return strings.Join(l, ",") }
 
 func TestHomeDirHostFallback(t *testing.T) {
 	// 无应用名时 HOME 默认 $HOME/.var/sandbox/home

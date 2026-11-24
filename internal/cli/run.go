@@ -51,13 +51,13 @@ func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool,
 	fs.StringVar(&p.Seccomp, "seccomp", "", "过滤等级: low|medium|high")
 	fs.Var(&syscalls, "allow-syscall", "追加白名单 syscall")
 	fs.Var(&env, "env", "环境变量 KEY=VALUE")
-	// 否决（对齐 flatpak override）
-	fs.Var(&noShare, "no-share", "否决已授予的 share 值")
-	fs.Var(&noSocket, "no-socket", "否决已授予的 socket 值")
-	fs.Var(&noDevice, "no-device", "否决已授予的 device 值")
-	fs.Var(&noAllow, "no-allow", "否决已授予的 allow 值")
-	fs.Var(&noFS, "no-fs", "否决已授予的 fs 项（按 ro:/path 原文精确匹配）")
-	fs.Var(&noDBus, "no-dbus", "否决已授予的 dbus 规则/预设")
+	// 否决（对齐 flatpak override --nosocket 等命名：no+字段，无中间横线）
+	fs.Var(&noShare, "noshare", "否决已授予的 share 值")
+	fs.Var(&noSocket, "nosocket", "否决已授予的 socket 值")
+	fs.Var(&noDevice, "nodevice", "否决已授予的 device 值")
+	fs.Var(&noAllow, "noallow", "否决已授予的 allow 值")
+	fs.Var(&noFS, "nofilesystem", "否决已授予的 fs 项（须逐字重复原授权 token，如 ro:/path）")
+	fs.Var(&noDBus, "nodbus", "否决已授予的 dbus 规则/预设（须逐字重复原授权 token）")
 	// bubblejail 对齐扩展
 	fs.Var(&harden, "harden", "加固: namespaces（递归封死沙箱内建 namespace）,sync（屏蔽落盘 syscall）")
 	fs.StringVar(&p.NetBackend, "net-backend", "", "网络后端: host(默认)|pasta|slirp4netns")
@@ -96,18 +96,19 @@ func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool,
 	}
 	// 授权 FLAG 不接受否决值："!" 前缀是否决语义，若授权 FLAG 也接受，
 	// "--device !dri" 会静默变成否决，与授权直觉相悖。否决必须走对应
-	// 的否决通道（--no-* FLAG、--unset-env 或配置文件 "!" 前缀）。
+	// 的否决通道（--nosocket 等 flatpak 风格否决 FLAG、--unset-env 或
+	// 配置文件 "!" 前缀）。
 	for _, g := range []struct {
 		name string
 		list strSlice
 		hint string // 提示正确的否决通道
 	}{
-		{"--share", share, "请改用对应的 --no-share FLAG 或配置文件写法"},
-		{"--socket", socket, "请改用对应的 --no-socket FLAG 或配置文件写法"},
-		{"--device", device, "请改用对应的 --no-device FLAG 或配置文件写法"},
-		{"--allow", allow, "请改用对应的 --no-allow FLAG 或配置文件写法"},
-		{"--fs", fsSpecs, "请改用对应的 --no-fs FLAG 或配置文件写法"},
-		{"--dbus", dbus, "请改用对应的 --no-dbus FLAG 或配置文件写法"},
+		{"--share", share, "请改用对应的 --noshare FLAG 或配置文件写法"},
+		{"--socket", socket, "请改用对应的 --nosocket FLAG 或配置文件写法"},
+		{"--device", device, "请改用对应的 --nodevice FLAG 或配置文件写法"},
+		{"--allow", allow, "请改用对应的 --noallow FLAG 或配置文件写法"},
+		{"--fs", fsSpecs, "请改用对应的 --nofilesystem FLAG 或配置文件写法"},
+		{"--dbus", dbus, "请改用对应的 --nodbus FLAG 或配置文件写法"},
 		{"--env", env, "请改用 --unset-env FLAG 或配置文件写法"},
 		{"--allow-syscall", syscalls, "请使用配置文件的 \"!\" 前缀写法"},
 		{"--harden", harden, "请使用配置文件的 \"!\" 前缀写法"},
@@ -151,8 +152,10 @@ func flagPerm(args []string) (*perm.Permissions, []string, []string, bool, bool,
 // mergeFlags 把 FLAG 值合并到配置合并结果上：
 // 标量字段非空覆盖；列表字段按优先级规则合并（高优先级授权/否决覆盖
 // 低优先级的相反表态，其余累加去重）。合并后先校验否决值合法性再结算
-// 否决项——否则 --no-* 吞掉后续 FLAG 得到的非法值会被静默当成否决。
-func mergeFlags(base *perm.Permissions, f *perm.Permissions) (*perm.Permissions, error) {
+// 否决项——否则 --nosocket 等否决 FLAG 吞掉后续 FLAG 得到的非法值会被
+// 静默当成否决。返回结算时产生的"否决未命中"警告（拼写/格式不一致的
+// 否决会静默失效，由调用方打印到 stderr 提醒用户）。
+func mergeFlags(base *perm.Permissions, f *perm.Permissions) (*perm.Permissions, []string, error) {
 	m := *base
 	if f.App != "" {
 		m.App = f.App
@@ -183,10 +186,10 @@ func mergeFlags(base *perm.Permissions, f *perm.Permissions) (*perm.Permissions,
 		m.NetBackend = f.NetBackend
 	}
 	if err := m.ValidateDenyValues(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	m.ApplyDenies()
-	return &m, nil
+	warns := m.ApplyDeniesWarned()
+	return &m, warns, nil
 }
 
 func cmdRun(argv []string) int {
@@ -210,10 +213,14 @@ func cmdRun(argv []string) int {
 		appCfg, _ := config.LoadApp(flags.App)
 		merged.Overlay(appCfg)
 	}
-	merged, err = mergeFlags(merged, flags)
+	var warns []string
+	merged, warns, err = mergeFlags(merged, flags)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "权限错误:", err)
 		return 2
+	}
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, w)
 	}
 	merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
 	if merged.Tmp == "" {
@@ -443,10 +450,14 @@ func cmdPermission(argv []string) int {
 		}
 		if name == "" {
 			// show 不带 app 时展示（全局+）FLAG
-			merged, err = mergeFlags(merged, flags)
+			var warns []string
+			merged, warns, err = mergeFlags(merged, flags)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "权限错误:", err)
 				return 2
+			}
+			for _, w := range warns {
+				fmt.Fprintln(os.Stderr, w)
 			}
 			merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
 			if merged.Tmp == "" {
@@ -456,10 +467,14 @@ func cmdPermission(argv []string) int {
 		} else {
 			appCfg, _ := config.LoadApp(name)
 			merged.Overlay(appCfg)
-			merged, err = mergeFlags(merged, flags)
+			var warns []string
+			merged, warns, err = mergeFlags(merged, flags)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "权限错误:", err)
 				return 2
+			}
+			for _, w := range warns {
+				fmt.Fprintln(os.Stderr, w)
 			}
 			merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
 			if merged.Tmp == "" {
@@ -490,10 +505,14 @@ func cmdPermission(argv []string) int {
 		if !noGlobal {
 			merged, _ = config.LoadGlobal()
 		}
-		merged, err = mergeFlags(merged, flags)
+		var warns []string
+		merged, warns, err = mergeFlags(merged, flags)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "权限错误:", err)
 			return 2
+		}
+		for _, w := range warns {
+			fmt.Fprintln(os.Stderr, w)
 		}
 		merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
 		if merged.Tmp == "" {

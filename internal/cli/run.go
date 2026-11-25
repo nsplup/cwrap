@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"cwrap/internal/bwrap"
 	"cwrap/internal/config"
 	"cwrap/internal/daemon"
 	"cwrap/internal/ipc"
@@ -221,6 +222,17 @@ func cmdRun(argv []string) int {
 	}
 	for _, w := range warns {
 		fmt.Fprintln(os.Stderr, w)
+	}
+	// --allow portal：预检宿主 flatpak-xdg-utils 的 xdg-open（路径随发行版
+	// 而异，config.toml 的 xdg_open_path 可自定义）。未找到时立即警告，
+	// 否则 portal 场景下容器内没有 xdg-open 覆盖、链接打开可能失效。
+	// daemon 侧也会解析并记录到 cwrapd.log（双保险）。
+	if perm.Has(merged.Allow, "portal") {
+		if prog, perr := config.LoadProgram(); perr == nil {
+			if _, w := bwrap.ResolveXDGOpen(prog.XDGOpenPath); w != "" {
+				fmt.Fprintln(os.Stderr, w)
+			}
+		}
 	}
 	merged.Seccomp = perm.DefaultSeccomp(merged.Seccomp)
 	if merged.Tmp == "" {

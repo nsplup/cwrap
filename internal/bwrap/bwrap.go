@@ -30,10 +30,59 @@ type Options struct {
 	DBusSessionPath string // 宿主侧 xdg-dbus-proxy 会话 socket 路径（空 = 无）
 	DBusSystemPath  string // 宿主侧系统 socket 路径（空 = 无）
 
+	// 宿主侧 flatpak-xdg-utils 的 xdg-open 路径（--allow portal 时覆盖
+	// 容器内 /usr/bin/xdg-open；空 = 未找到/未授予，不挂载）。
+	// 由调用方经 ResolveXDGOpen 解析后传入。
+	XDGOpenPath string
+
 	FlatpakInfoFD int // memfd 伪 /.flatpak-info（--allow portal；0 = 不传）
 	InfoFD        int // --info-fd（网络后端需要沙箱 PID；0 = 不传）
 	NetResolvFD   int // memfd DNS 配置（slirp4netns/pasta 后端；0 = 不传）
 	StatusFD      int // --json-status-fd（让 bwrap 自己写 bwrapinfo.json；0 = 不传）
+}
+
+// XDGOpenCandidates 是各发行版 flatpak-xdg-utils 的 xdg-open 常见安装
+// 路径（按探测顺序排列）。发行版间 libdir 差异较大，硬编码单一路径无法
+// 适配；也可在 config.toml 用 xdg_open_path 指定自定义路径。
+var XDGOpenCandidates = []string{
+	"/usr/lib/flatpak-xdg-utils/xdg-open",           // Arch/Fedora/upstream 默认
+	"/usr/libexec/flatpak-xdg-utils/xdg-open",       // Debian/Ubuntu（libexec 布局）
+	"/usr/lib64/flatpak-xdg-utils/xdg-open",         // lib64 布局发行版
+	"/usr/local/lib/flatpak-xdg-utils/xdg-open",     // 本地编译安装
+	"/usr/local/libexec/flatpak-xdg-utils/xdg-open", // 本地编译安装（libexec）
+}
+
+// ResolveXDGOpen 解析宿主侧 flatpak-xdg-utils 的 xdg-open 路径。
+// custom 为 config.toml 的 xdg_open_path（可空）：存在则直接采用；
+// 不存在则警告并回退自动探测。未配置时按候选路径探测多发行版布局，
+// 全部未命中返回空串与一条警告（--allow portal 下链接打开可能失效）。
+func ResolveXDGOpen(custom string) (path, warning string) {
+	return resolveXDGOpen(custom, XDGOpenCandidates)
+}
+
+func resolveXDGOpen(custom string, candidates []string) (string, string) {
+	if custom != "" {
+		if _, err := os.Stat(custom); err == nil {
+			return custom, ""
+		}
+		if path := probeXDGOpen(candidates); path != "" {
+			return path, fmt.Sprintf("警告: config.toml 的 xdg_open_path %q 不存在，已回退自动探测（命中 %s）", custom, path)
+		}
+		return "", fmt.Sprintf("警告: config.toml 的 xdg_open_path %q 不存在，且宿主未找到 flatpak-xdg-utils 的 xdg-open（已探测 lib/libexec/lib64 等候选路径）", custom)
+	}
+	if path := probeXDGOpen(candidates); path != "" {
+		return path, ""
+	}
+	return "", "警告: 宿主未找到 flatpak-xdg-utils 的 xdg-open（已探测 lib/libexec/lib64 等候选路径），--allow portal 的链接打开可能失效；可在 config.toml 用 xdg_open_path 指定路径"
+}
+
+func probeXDGOpen(candidates []string) string {
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
 }
 
 // Args 生成完整 bwrap 参数（不含 bwrap 自身路径）。
@@ -297,10 +346,6 @@ func Args(o *Options) ([]string, error) {
 		if docDir := filepath.Join(xdgRuntimeDir(uid), "doc"); docDir != "" {
 			a = append(a, "--bind-try", docDir, filepath.Join(rtIn, "doc"))
 		}
-		// flatpak-xdg-utils 提供的 xdg-open 走 portal OpenURI
-		if _, err := os.Stat("/usr/lib/flatpak-xdg-utils/xdg-open"); err == nil {
-			a = append(a, "--ro-bind-try", "/usr/lib/flatpak-xdg-utils/xdg-open", "/usr/bin/xdg-open")
-		}
 	}
 
 	// 额外文件系统授权（PATH 支持 flatpak 关键字展开，可一对多）
@@ -381,6 +426,16 @@ func Args(o *Options) ([]string, error) {
 
 	// 调试透传（对齐 bubblejail debug 服务 raw_bwrap_args）
 	a = append(a, p.RawBwrap...)
+
+	// flatpak-xdg-utils 的 xdg-open 覆盖必须是最后一个文件挂载。
+	// bwrap 后挂载覆盖先挂载：基线的 --ro-bind /usr、--fs 授权（如
+	// host-os 会整体重新挂载 /usr）、可执行文件自动挂载与 raw 参数都可能
+	// 重新提供原生 /usr/bin/xdg-open——覆盖放在 portal 块内会被它们遮蔽，
+	// 导致沙箱内直接调用 xdg-open 走的是原生版本（只有显式调用宿主路径
+	// 才能走 portal）。放在挂载序列末尾才能稳定生效（对齐 flatpak）。
+	if o.XDGOpenPath != "" {
+		a = append(a, "--ro-bind-try", o.XDGOpenPath, "/usr/bin/xdg-open")
+	}
 
 	if hardenNS {
 		// --harden namespaces（对齐 bubblejail namespaces_limits）：

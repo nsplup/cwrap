@@ -1,6 +1,7 @@
 package bwrap
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -107,5 +108,56 @@ func TestX11BindDedup(t *testing.T) {
 	}
 	if !argHas(a2, "--ro-bind-try", "/tmp/.X11-unix", "/tmp/.X11-unix") {
 		t.Fatal("tmpfs 模式仍需挂载 /tmp/.X11-unix")
+	}
+}
+
+// xdg-open 路径解析：自定义路径优先；不存在时回退探测并产生警告；
+// 全部未命中返回空串与警告（适配多发行版 libdir 差异）。
+func TestResolveXDGOpen(t *testing.T) {
+	dir := t.TempDir()
+	custom := dir + "/xdg-open"
+	if err := os.WriteFile(custom, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	miss := []string{dir + "/nope1", dir + "/nope2"}
+	hit := []string{dir + "/nope1", custom}
+
+	// 自定义路径存在：直接采用，无警告
+	p, w := resolveXDGOpen(custom, hit)
+	if p != custom || w != "" {
+		t.Fatalf("自定义路径应直接采用: %q %q", p, w)
+	}
+
+	// 自定义路径不存在：回退探测并警告
+	p, w = resolveXDGOpen(dir+"/missing", hit)
+	if p != custom || w == "" || !strings.Contains(w, "回退") {
+		t.Fatalf("不存在的自定义路径应回退探测并警告: %q %q", p, w)
+	}
+
+	// 自定义路径不存在且候选全 miss：空路径 + 警告
+	p, w = resolveXDGOpen(dir+"/missing", miss)
+	if p != "" || w == "" || !strings.Contains(w, "xdg_open_path") {
+		t.Fatalf("候选全 miss 应返回空串并警告: %q %q", p, w)
+	}
+
+	// 未配置自定义路径：命中候选即返回，无警告
+	p, w = resolveXDGOpen("", hit)
+	if p != custom || w != "" {
+		t.Fatalf("未配置时应探测候选: %q %q", p, w)
+	}
+
+	// 未配置且全部 miss：空路径 + 警告（提示 xdg_open_path 接口）
+	p, w = resolveXDGOpen("", miss)
+	if p != "" || w == "" || !strings.Contains(w, "xdg_open_path") {
+		t.Fatalf("未配置且全 miss 应返回空串并警告: %q %q", p, w)
+	}
+
+	// 候选按顺序取第一个命中
+	first := dir + "/first"
+	if err := os.WriteFile(first, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := resolveXDGOpen("", []string{first, custom}); p != first {
+		t.Fatalf("候选应按顺序命中首个存在项: %q", p)
 	}
 }

@@ -541,6 +541,17 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 	}
 
 	uid := syscall.Getuid()
+	// --allow portal：解析宿主 flatpak-xdg-utils 的 xdg-open 路径
+	// （config.toml 的 xdg_open_path 优先，否则按发行版候选探测）。
+	// 未命中/回退时警告写 daemon 日志；用户可见的警告由 CLI 侧打印。
+	xdgOpenPath := ""
+	if perm.Has(spec.Allow, "portal") {
+		p2, w2 := bwrap.ResolveXDGOpen(prog.XDGOpenPath)
+		if w2 != "" {
+			fmt.Fprintln(os.Stderr, w2)
+		}
+		xdgOpenPath = p2
+	}
 	args, aerr := bwrap.Args(&bwrap.Options{
 		Perm:            spec,
 		UID:             uid,
@@ -548,6 +559,7 @@ func (s *Server) runSession(uc *net.UnixConn, br *bufio.Reader, req *ipc.Request
 		SeccompFD:       seccompFD,
 		DBusSessionPath: proxyPath(sessionProxy, filepath.Join(dir, "session")),
 		DBusSystemPath:  proxyPath(systemProxy, filepath.Join(dir, "system")),
+		XDGOpenPath:     xdgOpenPath,
 		FlatpakInfoFD:   flatpakInfoFD,
 		InfoFD:          infoFD,
 		NetResolvFD:     netResolvFD,

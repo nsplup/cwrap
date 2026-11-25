@@ -2,6 +2,7 @@ package bwrap
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -170,6 +171,11 @@ func TestPortalPackage(t *testing.T) {
 	o := baseOpts(t, "tmpfs")
 	o.Perm.Allow = []string{"portal"}
 	o.FlatpakInfoFD = 7
+	// 宿主 xdg-open 路径由调用方解析后传入
+	o.XDGOpenPath = filepath.Join(t.TempDir(), "xdg-open")
+	if err := os.WriteFile(o.XDGOpenPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	a, err := Args(o)
 	if err != nil {
 		t.Fatal(err)
@@ -179,6 +185,52 @@ func TestPortalPackage(t *testing.T) {
 	}
 	if !argHas(a, "--setenv", "GTK_USE_PORTAL", "1") {
 		t.Fatalf("GTK_USE_PORTAL 缺失")
+	}
+	if !argHas(a, "--ro-bind-try", o.XDGOpenPath, "/usr/bin/xdg-open") {
+		t.Fatalf("xdg-open 覆盖缺失: %v", o.XDGOpenPath)
+	}
+
+	// 未找到宿主 xdg-open 时不挂载（警告由 CLI/daemon 打印）
+	o2 := baseOpts(t, "tmpfs")
+	o2.Perm.Allow = []string{"portal"}
+	o2.FlatpakInfoFD = 7
+	a2, err := Args(o2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if argHas(a2, "/usr/bin/xdg-open") {
+		t.Fatalf("无宿主 xdg-open 时不应挂载覆盖")
+	}
+}
+
+// xdg-open 覆盖必须是最后一个文件挂载：bwrap 后挂载覆盖先挂载，
+// --fs host-os 等授权会在 portal 块之后重新挂载 /usr，遮蔽放在前面的
+// 覆盖（表现为沙箱内直接调用 xdg-open 仍是原生版本）。
+func TestXDGOpenOverrideOrder(t *testing.T) {
+	o := baseOpts(t, "tmpfs")
+	o.Perm.Allow = []string{"portal"}
+	o.Perm.FS = []string{"ro:/opt/data"} // FS 授权在 portal 块之后生成挂载
+	o.XDGOpenPath = "/tmp/xdg-open"
+	a, err := Args(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idxOf := func(v string) int {
+		for i, x := range a {
+			if x == v {
+				return i
+			}
+		}
+		return -1
+	}
+	override := idxOf(o.XDGOpenPath)
+	usrBind := idxOf("/usr") // 基线 --ro-bind /usr /usr
+	fsBind := idxOf("/opt/data")
+	if override < 0 || usrBind < 0 || fsBind < 0 {
+		t.Fatalf("缺少挂载项: override=%d usr=%d fs=%d", override, usrBind, fsBind)
+	}
+	if override < usrBind || override < fsBind {
+		t.Fatalf("xdg-open 覆盖必须晚于 /usr 与 --fs 挂载: override=%d usr=%d fs=%d", override, usrBind, fsBind)
 	}
 }
 

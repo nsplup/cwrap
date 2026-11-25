@@ -44,6 +44,10 @@ func LoadGlobal() (*perm.Permissions, error) {
 type Program struct {
 	BwrapPath        string `toml:"bwrap_path,omitempty"`          // 默认 "bwrap"（按 PATH 查找）
 	XdgDBusProxyPath string `toml:"xdg_dbus_proxy_path,omitempty"` // 默认 "xdg-dbus-proxy"（按 PATH 查找）
+	// 自定义 flatpak-xdg-utils 的 xdg-open 路径（--allow portal 时覆盖容器
+	// 内 /usr/bin/xdg-open）。留空则按多发行版候选路径自动探测
+	// （lib/libexec/lib64 等）；指定的文件不存在时警告并回退自动探测。
+	XDGOpenPath string `toml:"xdg_open_path,omitempty"`
 }
 
 // DefaultBwrapCmd / DefaultDBusProxyCmd 是未自定义时使用的命令名。

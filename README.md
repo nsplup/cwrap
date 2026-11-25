@@ -136,6 +136,10 @@ unset_env = []
 # cwrap 程序级配置（~/.config/cwrap/config.toml）
 bwrap_path = "/usr/local/bin/bwrap"           # 默认 "bwrap"
 xdg_dbus_proxy_path = "/opt/bin/xdg-dbus-proxy" # 默认 "xdg-dbus-proxy"
+# flatpak-xdg-utils 的 xdg-open 路径（--allow portal 时覆盖容器内
+# /usr/bin/xdg-open）；留空则自动探测 lib/libexec/lib64 等发行版布局，
+# 全部未命中时打印警告
+# xdg_open_path = "/usr/libexec/flatpak-xdg-utils/xdg-open"
 ```
 
 ## 参数传递方式

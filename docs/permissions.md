@@ -75,7 +75,7 @@ net_backend_args/unset_env/raw_bwrap/raw_dbus）累加并去重。
 | `preset:gnome-toolkit` | 无 | `gnome_toolkit` 服务 | portal.*/dconf/gtk.vfs |
 | `preset:ibus` / `preset:fcitx` | 输入法 portal | `ibus`/`fcitx` 服务 | talk 规则 + IM 环境变量（GTK/QT_IM_MODULE 等） |
 | `--dbus-arg ARG` | 无 | `debug` 服务 raw_dbus_args | 原样透传 xdg-dbus-proxy |
-| `--allow portal` | portal 体验 | `xdg_desktop_portal` 完整包 | memfd 伪 `/.flatpak-info`（`--ro-bind-data`）+ `GTK_USE_PORTAL=1` + 自动注入 `preset:portal` + flatpak-xdg-utils 的 xdg-open 覆盖（存在时） |
+| `--allow portal` | portal 体验 | `xdg_desktop_portal` 完整包 | memfd 伪 `/.flatpak-info`（`--ro-bind-data`）+ `GTK_USE_PORTAL=1` + 自动注入 `preset:portal` + flatpak-xdg-utils 的 xdg-open 覆盖（覆盖挂载置于挂载序列末尾，稳定压过 /usr 类挂载；路径按 lib/libexec/lib64 等发行版布局自动探测，或由 config.toml 的 `xdg_open_path` 指定，宿主未找到时打印警告） |
 
 ### 设备（device）
 

@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 
-	"cwrap/internal/daemon"
 	"cwrap/internal/version"
 )
 
@@ -42,12 +41,6 @@ func Main(args []string) int {
 		return cmdKill(args[1:])
 	case "clean":
 		return cmdClean()
-	case "daemon":
-		if err := daemon.Run(); err != nil {
-			fmt.Fprintln(os.Stderr, "cwrapd:", err)
-			return 1
-		}
-		return 0
 	case "version", "--version", "-v":
 		fmt.Println("cwrap " + version.Value)
 		return 0
@@ -74,10 +67,9 @@ func usageTo(w io.Writer) {
   cwrap run [FLAGS] -- 命令 [参数...]        在沙箱中运行程序（默认零权限）
   cwrap permission show [APP] [FLAGS]        显示合并后的有效权限（共用下列 FLAG）
   cwrap permission export APP [FLAGS]        将授权固化为应用配置文件
-  cwrap ps                                   列出运行中的沙箱
+  cwrap ps                                   列出运行中的沙箱（实例注册表）
   cwrap kill <ID|APP>                        终止运行中的沙箱
-  cwrap clean                                清扫陈旧的临时目录
-  cwrap daemon                               启动守护进程（通常自动拉起）
+  cwrap clean                                清扫陈旧的实例目录
   cwrap version | help
 
 授权 FLAG :

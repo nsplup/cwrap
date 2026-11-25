@@ -75,10 +75,19 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
   [ $? -ne 0 ] && ok "dbus error without host bus" || bad "dbus error without host bus"
 fi
 
-# 11. daemon 清理：运行结束后 XDG_RUNTIME_DIR 下无残留运行目录
+# 11. 实例清理：运行结束后无残留实例子目录（持久化配置目录保留）
 sleep 1
-left=$(ls "$XDG_RUNTIME_DIR/cwrap" 2>/dev/null | rg -v 'cwrapd.sock|cwrapd.log' | wc -l)
+left=$(find "$XDG_RUNTIME_DIR/cwrap" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)
 [ "$left" = 0 ] && ok "temp cleanup" || bad "temp cleanup (left=$left)"
+appdir="$XDG_RUNTIME_DIR/cwrap/org.cwrap.App.demo"
+[ -d "$appdir" ] && ok "persistent app dir kept" || bad "persistent app dir kept"
+
+# 11b. 启动清扫：死 PID 的残留实例目录与表外孤儿目录应在下次启动时被清理
+mkdir -p "$appdir/dead0000000000000000000000000000" "$appdir/orphan00000000000000000000000000"
+printf '{"dead0000000000000000000000000000":{"pid":999999999,"start":1,"app":"demo"}}' > "$appdir/instances.json"
+"$CWRAP" run --app demo "${SEC_OFF[@]}" -- /bin/true >/dev/null 2>&1
+{ [ ! -d "$appdir/dead0000000000000000000000000000" ] && [ ! -d "$appdir/orphan00000000000000000000000000" ]; } \
+  && ok "stale instance swept on launch" || bad "stale instance swept on launch"
 
 # 12. --tmp 两档 dry-run（参数拼装）与非法值报错
 t "dry-run tmp tmpfs" 0 "$CWRAP" run --app demo --tmp tmpfs --dry-run -- /bin/echo hi

@@ -41,7 +41,7 @@ net_backend_args/unset_env/raw_bwrap/raw_dbus）累加并去重。
 |---|---|---|---|
 | `network` | `--share=network` | `network` 服务 | 含 resolv.conf 断链修复（systemd-resolved symlink 场景补挂 `/run/systemd/resolve`） |
 | `ipc` | `--share=ipc` | （默认隔离） | 不授予则 `--unshare-ipc` |
-| `--net-backend pasta` | 无 | `pasta_network` 服务 | 独立用户态网络栈；bwrap 侧 `--unshare-net` + `--info-fd` 取 PID 后由 cwrapd 挂接 |
+| `--net-backend pasta` | 无 | `pasta_network` 服务 | 独立用户态网络栈；bwrap 侧 `--unshare-net` + `--info-fd` 取 PID 后由 cwrap 主进程挂接 |
 | `--net-backend slirp4netns` | 无 | `slirp4netns` 服务 | 同上；DNS 注入 `10.0.2.3`（`--ro-bind-data` 覆盖 resolv.conf） |
 
 ### socket
@@ -150,7 +150,7 @@ public-share/templates/videos`；尾缀 `?` 表示目标不存在不报错
   `--dbus preset:systray`；同时需要会话总线（portal 包或任意 dbus 规则
   均可提供）。
 - 代理 socket 写入 `$XDG_RUNTIME_DIR/cwrap/<时间戳>/session|system`，
-  结束后由 cwrapd 清理；沙箱内地址固定 `/run/cwrap/sessionBus|systemBus`。
+  结束后由 cwrap 主进程清理（异常残留由同配置下次启动清扫）；沙箱内地址固定 `/run/cwrap/sessionBus|systemBus`。
 - `--socket gpg-agent` 仅**只读**绑定具体 agent socket 文件
   （`S.gpg-agent`、`S.gpg-agent.extra`、`S.gpg-agent.ssh`，对齐 flatpak
   `flatpak-run-sockets.c`）；沙箱无法写宿主 gnupg 目录。

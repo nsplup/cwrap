@@ -41,7 +41,7 @@ func SystemAddress() (string, bool) {
 // Proxy 是一个已就绪的 xdg-dbus-proxy 进程。
 type Proxy struct {
 	cmd   *exec.Cmd
-	ready *os.File // sync 管道读端：由 daemon 持有到代理退出，绝不提前关闭
+	ready *os.File // sync 管道读端：由 cwrap 主进程持有到代理退出，绝不提前关闭
 }
 
 // NeedBuses 根据权限判断需要代理哪些总线。
@@ -134,9 +134,14 @@ func dbusProxyArgs(rules []string) ([]string, error) {
 // add_bwrap_wrapper）：宿主根目录逐项挂入代理命名空间，并把规范形态的
 // /.flatpak-info 以 --ro-bind-data 挂到代理的根。这是 xdg-desktop-portal
 // 识别 caller 身份的前提——portal 经 /proc/<代理pid>/root/.flatpak-info
-// 读取 name 与 instance-id（instance-id 的运行时验证由 daemon 写入
-// $XDG_RUNTIME_DIR/.flatpak/<id>/bwrapinfo.json 完成）。
-func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpakInfo []byte, logw io.Writer) (*Proxy, error) {
+// 读取 name 与 instance-id（instance-id 的运行时验证由 bwrap 经
+// --json-status-fd 写入 $XDG_RUNTIME_DIR/.flatpak/<id>/bwrapinfo.json 完成）。
+//
+// syncR 为生命周期 sync 管道读端（写端由 cwrap 主进程持有）：
+// 包装运行时经 bwrap --sync-fd 传入，主进程退出即代理沙箱终止；
+// 未包装运行时代理自身的 --fd 就绪管道承担同一语义（读端由主进程
+// 持有到运行结束）。syncR 的所有权归调用方，本函数不关闭它。
+func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpakInfo []byte, logw io.Writer, syncR *os.File) (*Proxy, error) {
 	bus := "session"
 	if strings.HasPrefix(filepath.Base(socketPath), "system") {
 		bus = "system"
@@ -179,7 +184,7 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 		cmd.ExtraFiles = []*os.File{readyW, proxyArgsFile}
 	} else {
 		// fd 3 = ready 同步管道；fd 4 = 包装 bwrap 参数；fd 5 = 代理参数；
-		// fd 6 = .flatpak-info（--ro-bind-data）
+		// fd 6 = .flatpak-info（--ro-bind-data）；fd 7 = 生命周期 sync-fd
 		infoFile, ierr := memfdBytes("cwrap-flatpak-info", flatpakInfo)
 		if ierr != nil {
 			readyR.Close()
@@ -187,7 +192,11 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 			proxyArgsFile.Close()
 			return nil, ierr
 		}
-		wArgs := dbusProxyWrapperArgs(filepath.Dir(socketPath), 6)
+		syncFD := 0
+		if syncR != nil {
+			syncFD = 7
+		}
+		wArgs := dbusProxyWrapperArgs(filepath.Dir(socketPath), 6, syncFD)
 		wArgsFile, werr := memfdArgs("cwrap-bwrap-proxy-args", wArgs)
 		if werr != nil {
 			readyR.Close()
@@ -200,9 +209,12 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 			bwrapPath = config.DefaultBwrapCmd
 		}
 		// 命令行：bwrap --args 4 -- xdg-dbus-proxy --fd=3 --args=5
-		//（--args fd 内容遇 "--" 停止，命令必须留在命令行，见 daemon 同款注释）
+		//（--args fd 内容遇 "--" 停止，命令必须留在命令行，见 run 包同款注释）
 		cmd = exec.Command(bwrapPath, "--args", "4", "--", proxyPath, "--fd=3", "--args=5")
 		cmd.ExtraFiles = []*os.File{readyW, wArgsFile, proxyArgsFile, infoFile}
+		if syncR != nil {
+			cmd.ExtraFiles = append(cmd.ExtraFiles, syncR)
+		}
 	}
 	cmd.Stdout = logw
 	cmd.Stderr = logw
@@ -224,7 +236,7 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 	}
 	// 注意：不要 close readyR！
 	// xdg-dbus-proxy 监视此 fd 的 HUP/ERR：对端关闭 = 立即 unlink socket 并退出。
-	// 读端必须由 daemon 持有到沙箱运行结束（见 Stop）。
+	// 读端必须由 cwrap 主进程持有到沙箱运行结束（见 Stop）。
 	return pr, nil
 }
 
@@ -277,8 +289,12 @@ func memfdBytes(name string, data []byte) (*os.File, error) {
 // 代理 socket 所在目录读写（代理在其中创建并 unlink socket）；
 // /.flatpak-info 以 --ro-bind-data（perms 0600）提供——flatpak 注释原话：
 // "primary to allow the command to be run with a proper /.flatpak-info"。
-func dbusProxyWrapperArgs(socketDir string, infoFD int) []string {
+// syncFD > 0 时追加 --sync-fd：代理沙箱生命周期与 cwrap 主进程同步。
+func dbusProxyWrapperArgs(socketDir string, infoFD, syncFD int) []string {
 	var a []string
+	if syncFD > 0 {
+		a = append(a, "--sync-fd", strconv.Itoa(syncFD))
+	}
 	if entries, err := os.ReadDir("/"); err == nil {
 		for _, e := range entries {
 			name := e.Name()
@@ -317,7 +333,7 @@ func (p *Proxy) Stop() {
 		go func() { p.cmd.Wait(); close(done) }()
 		select {
 		case <-done: // 代理收到 HUP，已自停并清理 socket
-		case <-time.After(2 * time.Second): // 兜底：SIGKILL（socket 残留由 cleanStale 兜底）
+		case <-time.After(2 * time.Second): // 兜底：SIGKILL（socket 残留由下次启动清扫兜底）
 			if p.cmd.Process != nil {
 				p.cmd.Process.Kill()
 			}
@@ -330,18 +346,4 @@ func (p *Proxy) Stop() {
 		p.cmd.Process.Kill()
 		p.cmd.Wait()
 	}
-}
-
-// SocketDir 为一次运行创建 socket 存放目录，返回路径与唯一 ID。
-func SocketDir(runtimeDir string) (dir, id string, err error) {
-	id = fmt.Sprintf("%d", time.Now().UnixNano())
-	dir = filepath.Join(runtimeDir, "cwrap", id)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", "", err
-	}
-	// 记录 daemon pid，供陈旧目录清扫判断存活
-	if err := os.WriteFile(filepath.Join(dir, ".pid"), fmt.Append(nil, os.Getpid()), 0o600); err != nil {
-		return "", "", err
-	}
-	return dir, id, nil
 }

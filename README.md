@@ -5,10 +5,13 @@
 
 - **默认零权限**——无网络、无 X11/Wayland、无 D-Bus、HOME 完全隔离、seccomp 最严格档可用；
 - 所有能力通过 FLAG 或 TOML 配置文件**显式授权**；
-- 守护进程 `cwrapd` 管理子进程生命周期、转发 stdio/信号/退出码、自动清理临时文件；
+- **无守护进程**：`cwrap run` 主进程直接监管沙箱，转发信号/退出码；主沙箱与
+  D-Bus 代理沙箱的生命周期经 `bwrap --sync-fd` 与主进程严格同步（主进程退出
+  即沙箱终止，含被 SIGKILL 的情形）；
 - seccomp BPF 过滤器由 cwrap **纯 Go 内存生成**，经 memfd 以 FD 传给 `bwrap --seccomp`；
-- D-Bus 由 `xdg-dbus-proxy` 接管，**默认零放行规则**，socket 存放于
-  `$XDG_RUNTIME_DIR/cwrap/<时间戳>/`。
+- D-Bus 由 `xdg-dbus-proxy` 接管，**默认零放行规则**；临时文件位于**持久化的
+  按配置目录** `$XDG_RUNTIME_DIR/cwrap/<应用名>/<instanceID>/`，目录内
+  `instances.json` 记录 instanceID 与 PID 的映射，每次启动先清扫残留实例。
 
 依赖运行时：`bwrap`（必装）、`xdg-dbus-proxy`（仅使用 D-Bus 权限时需要）。
 无需 root（bubblewrap 走非特权 user namespace）。
@@ -42,7 +45,7 @@ cwrap run --app demo \
 # 高严格 seccomp（默认拒绝+白名单，含 W^X 保护）并追加白名单
 cwrap run --app build --seccomp high --allow-syscall memfd_create,clone3 -- ./build.sh
 
-# /tmp 三档：私有目录（默认，退出由 daemon 清理）/ 全空 tmpfs / 宿主 /tmp
+# /tmp 两档：全空 tmpfs（默认）/ 宿主 /tmp
 cwrap run --app demo --tmp tmpfs -- /usr/bin/myapp
 cwrap run --app demo --tmp host -- /usr/bin/myapp
 cwrap run --app demo --tmp /mnt/share/tmp -- /usr/bin/myapp
@@ -87,10 +90,9 @@ cwrap run --app demo --socket session-bus -- /usr/bin/myapp
 | `cwrap run [FLAGS] -- CMD [ARGS…]` | 在沙箱中运行命令 |
 | `cwrap permission show [APP] [FLAGS…]` | 显示合并后的有效权限 |
 | `cwrap permission export APP [FLAGS…]` | 把 FLAGS/全局合并结果写入应用配置 |
-| `cwrap ps` | 列出运行中的沙箱 |
+| `cwrap ps` | 列出运行中的沙箱（读持久化实例注册表） |
 | `cwrap kill <ID\|APP>` | 终止沙箱 |
-| `cwrap clean` | 清扫陈旧的运行目录 |
-| `cwrap daemon` | 手动启动守护进程（通常自动拉起） |
+| `cwrap clean` | 清扫陈旧的实例目录 |
 
 `--` 之后的可执行文件若不在沙箱挂载范围内（如 `~/bin/foo`），cwrap 会
 自动以只读方式挂入（脚本会连带 shebang 解释器）。
@@ -156,14 +158,31 @@ bwrap 与 xdg-dbus-proxy 的全部参数均经 **fd 传递**，彻底规避 ARG_
 ## 架构
 
 ```
-cwrap run (CLI)
-   │  UDS + SCM_RIGHTS(stdio) + JSON
-   ▼
-cwrapd（daemon，同二进制，空闲 30s 自动退出）
+cwrap run（单进程，无守护进程）
    ├─ 纯 Go cBPF 生成 → memfd → --seccomp FD
-   ├─ xdg-dbus-proxy（默认零规则，socket 在 XDG_RUNTIME_DIR）
-   └─ bwrap（最小 rootfs / 隔离 HOME / 按授权挂载）
+   ├─ xdg-dbus-proxy（默认零规则；portal 场景由 bwrap 包装运行）
+   ├─ bwrap（最小 rootfs / 隔离 HOME / 按授权挂载）
+   └─ 生命周期：sync 管道写端由 cwrap 持有，读端经 --sync-fd 交给
+      主沙箱 bwrap 与代理包装 bwrap——cwrap 退出（含 SIGKILL）即沙箱终止
 ```
+
+### 持久化运行目录与实例注册表
+
+每个配置占用一个持久化目录，目录名与伪造 `.flatpak-info` 的应用名
+（`flatpakAppName`）一致；单次运行的 socket 目录以 instanceID 命名：
+
+```
+$XDG_RUNTIME_DIR/cwrap/
+└── org.cwrap.App.demo/            # 持久化配置目录（跨运行保留）
+    ├── instances.json             # instanceID -> {pid, start, app} 映射表
+    ├── .lock                      # 注册表 flock（并发启动/退出串行化）
+    └── <instanceID>/              # 单次运行 socket 目录（session/system/proxy.log）
+```
+
+- 每次通过同一配置启动沙箱，先在锁内清扫残留：映射表中 PID 已死
+  （starttime 校验防 PID 复用）的实例目录与表外孤儿目录；
+- 正常退出注销自身条目并删除实例目录；异常退出的残留由下次启动兜底；
+- `ps`/`kill`/`clean` 直接读写该注册表，无需任何常驻进程。
 
 ## 测试
 

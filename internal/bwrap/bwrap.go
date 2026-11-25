@@ -39,6 +39,7 @@ type Options struct {
 	InfoFD        int // --info-fd（网络后端需要沙箱 PID；0 = 不传）
 	NetResolvFD   int // memfd DNS 配置（slirp4netns/pasta 后端；0 = 不传）
 	StatusFD      int // --json-status-fd（让 bwrap 自己写 bwrapinfo.json；0 = 不传）
+	SyncFD        int // --sync-fd（生命周期与 cwrap 主进程同步；0 = 不传）
 }
 
 // XDGOpenCandidates 是各发行版 flatpak-xdg-utils 的 xdg-open 常见安装
@@ -90,12 +91,18 @@ func Args(o *Options) ([]string, error) {
 	p := o.Perm
 	uid := o.UID
 	a := []string{
-		"--die-with-parent",
 		"--unshare-user",
 		"--unshare-pid",
 		"--unshare-uts",
 		"--unshare-cgroup",
 		"--clearenv",
+	}
+
+	// 生命周期同步（取代 --die-with-parent）：sync-fd 是一条管道的读端，
+	// 写端由 cwrap 主进程持有。主进程无论以何种方式退出（含 SIGKILL），
+	// 写端随进程关闭，bwrap 检测到 HUP 立即终止沙箱。
+	if o.SyncFD > 0 {
+		a = append(a, "--sync-fd", strconv.Itoa(o.SyncFD))
 	}
 
 	// --harden namespaces（对齐 bubblejail namespaces_limits）：pid1 需要

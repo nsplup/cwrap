@@ -473,7 +473,7 @@ func ExpandDbusPresets(tokens []string) ([]string, error) {
 			// 广播；各接口在服务端按 caller app-id 二次授权（Document portal
 			// 授权表、ScreenCast 恢复 token 等）。caller 身份由 /proc/<代理pid>/
 			// root/.flatpak-info + $XDG_RUNTIME_DIR/.flatpak/<instance-id>/
-			// bwrapinfo.json 验证（见 daemon 与 dbusproxy 的对应实现）。
+			// bwrapinfo.json 验证（见 run 与 dbusproxy 的对应实现）。
 			out = append(out,
 				"session.talk=org.freedesktop.portal.*",
 				"session.call=org.freedesktop.portal.*=*",

@@ -190,7 +190,7 @@ func TestPortalPackage(t *testing.T) {
 		t.Fatalf("xdg-open 覆盖缺失: %v", o.XDGOpenPath)
 	}
 
-	// 未找到宿主 xdg-open 时不挂载（警告由 CLI/daemon 打印）
+	// 未找到宿主 xdg-open 时不挂载（警告由 CLI 打印）
 	o2 := baseOpts(t, "tmpfs")
 	o2.Perm.Allow = []string{"portal"}
 	o2.FlatpakInfoFD = 7

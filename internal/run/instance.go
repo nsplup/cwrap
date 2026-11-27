@@ -37,7 +37,7 @@ const (
 )
 
 // InstanceMeta 是映射表中一个实例的属主信息。
-// PID 为持有 sync-fd 写端的 cwrap 主进程；Start 为其 /proc starttime，
+// PID 为启动该沙箱的 cwrap 主进程；Start 为其 /proc starttime，
 // 用于区分 PID 被内核回收复用的情形。
 type InstanceMeta struct {
 	PID   int    `json:"pid"`
@@ -221,9 +221,9 @@ func listAt(base string) []RunningInfo {
 	return out
 }
 
-// Kill 终止目标沙箱：向持有 sync-fd 的 cwrap 主进程发 SIGTERM（由其
-// 转发给沙箱进程组）；宽限 3 秒仍存活则 SIGKILL 主进程——sync-fd 写端
-// 随之关闭，bwrap 检测到 HUP 后立即回收沙箱。
+// Kill 终止目标沙箱：向 cwrap 主进程发 SIGTERM（由其转发给沙箱进程组）；
+// 宽限 3 秒仍存活则 SIGKILL 主进程——bwrap 带 --die-with-parent，
+// 内核 PDEATHSIG 会随主进程退出依序回收 monitor 与沙箱。
 // target 可为 instanceID、应用名或持久化目录名（flatpakAppName）。
 func Kill(target string) error {
 	base := runtimeBase()

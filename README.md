@@ -6,8 +6,8 @@
 - **默认零权限**——无网络、无 X11/Wayland、无 D-Bus、HOME 完全隔离、seccomp 最严格档可用；
 - 所有能力通过 FLAG 或 TOML 配置文件**显式授权**；
 - **无守护进程**：`cwrap run` 主进程直接监管沙箱，转发信号/退出码；主沙箱与
-  D-Bus 代理沙箱的生命周期经 `bwrap --sync-fd` 与主进程严格同步（主进程退出
-  即沙箱终止，含被 SIGKILL 的情形）；
+  D-Bus 代理沙箱的生命周期经 `bwrap --die-with-parent`（内核 PR_SET_PDEATHSIG）
+  与主进程严格同步（主进程退出即沙箱终止，含被 SIGKILL 的情形）；
 - seccomp BPF 过滤器由 cwrap **纯 Go 内存生成**，经 memfd 以 FD 传给 `bwrap --seccomp`；
 - D-Bus 由 `xdg-dbus-proxy` 接管，**默认零放行规则**；临时文件位于**持久化的
   按配置目录** `$XDG_RUNTIME_DIR/cwrap/<应用名>/<instanceID>/`，目录内
@@ -162,8 +162,8 @@ cwrap run（单进程，无守护进程）
    ├─ 纯 Go cBPF 生成 → memfd → --seccomp FD
    ├─ xdg-dbus-proxy（默认零规则；portal 场景由 bwrap 包装运行）
    ├─ bwrap（最小 rootfs / 隔离 HOME / 按授权挂载）
-   └─ 生命周期：sync 管道写端由 cwrap 持有，读端经 --sync-fd 交给
-      主沙箱 bwrap 与代理包装 bwrap——cwrap 退出（含 SIGKILL）即沙箱终止
+   └─ 生命周期：bwrap 带 --die-with-parent（PR_SET_PDEATHSIG），内核保证
+      cwrap 退出（含 SIGKILL）即依序 SIGKILL monitor 与沙箱进程
 ```
 
 ### 持久化运行目录与实例注册表

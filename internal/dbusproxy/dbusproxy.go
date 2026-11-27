@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -136,12 +137,7 @@ func dbusProxyArgs(rules []string) ([]string, error) {
 // 识别 caller 身份的前提——portal 经 /proc/<代理pid>/root/.flatpak-info
 // 读取 name 与 instance-id（instance-id 的运行时验证由 bwrap 经
 // --json-status-fd 写入 $XDG_RUNTIME_DIR/.flatpak/<id>/bwrapinfo.json 完成）。
-//
-// syncR 为生命周期 sync 管道读端（写端由 cwrap 主进程持有）：
-// 包装运行时经 bwrap --sync-fd 传入，主进程退出即代理沙箱终止；
-// 未包装运行时代理自身的 --fd 就绪管道承担同一语义（读端由主进程
-// 持有到运行结束）。syncR 的所有权归调用方，本函数不关闭它。
-func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpakInfo []byte, logw io.Writer, syncR *os.File) (*Proxy, error) {
+func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpakInfo []byte, logw io.Writer) (*Proxy, error) {
 	bus := "session"
 	if strings.HasPrefix(filepath.Base(socketPath), "system") {
 		bus = "system"
@@ -184,7 +180,7 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 		cmd.ExtraFiles = []*os.File{readyW, proxyArgsFile}
 	} else {
 		// fd 3 = ready 同步管道；fd 4 = 包装 bwrap 参数；fd 5 = 代理参数；
-		// fd 6 = .flatpak-info（--ro-bind-data）；fd 7 = 生命周期 sync-fd
+		// fd 6 = .flatpak-info（--ro-bind-data）
 		infoFile, ierr := memfdBytes("cwrap-flatpak-info", flatpakInfo)
 		if ierr != nil {
 			readyR.Close()
@@ -192,11 +188,7 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 			proxyArgsFile.Close()
 			return nil, ierr
 		}
-		syncFD := 0
-		if syncR != nil {
-			syncFD = 7
-		}
-		wArgs := dbusProxyWrapperArgs(filepath.Dir(socketPath), 6, syncFD)
+		wArgs := dbusProxyWrapperArgs(filepath.Dir(socketPath), 6)
 		wArgsFile, werr := memfdArgs("cwrap-bwrap-proxy-args", wArgs)
 		if werr != nil {
 			readyR.Close()
@@ -212,12 +204,13 @@ func Start(bwrapPath, proxyPath, addr, socketPath string, rules []string, flatpa
 		//（--args fd 内容遇 "--" 停止，命令必须留在命令行，见 run 包同款注释）
 		cmd = exec.Command(bwrapPath, "--args", "4", "--", proxyPath, "--fd=3", "--args=5")
 		cmd.ExtraFiles = []*os.File{readyW, wArgsFile, proxyArgsFile, infoFile}
-		if syncR != nil {
-			cmd.ExtraFiles = append(cmd.ExtraFiles, syncR)
-		}
 	}
 	cmd.Stdout = logw
 	cmd.Stderr = logw
+	// 包装 bwrap（或未包装时的代理自身）独占一个进程组：Stop 超时以
+	// kill(-pgid, SIGKILL) 整组回收，避免"只杀包装 bwrap → 代理（其子
+	// 进程）变孤儿继续运行"。无 portal 分支下代理自己就是组首，行为等价。
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		readyR.Close()
 		readyW.Close()
@@ -289,12 +282,14 @@ func memfdBytes(name string, data []byte) (*os.File, error) {
 // 代理 socket 所在目录读写（代理在其中创建并 unlink socket）；
 // /.flatpak-info 以 --ro-bind-data（perms 0600）提供——flatpak 注释原话：
 // "primary to allow the command to be run with a proper /.flatpak-info"。
-// syncFD > 0 时追加 --sync-fd：代理沙箱生命周期与 cwrap 主进程同步。
-func dbusProxyWrapperArgs(socketDir string, infoFD, syncFD int) []string {
+//
+// 生命周期同步（任一层生效即回收包装 bwrap 及其代理子进程）：
+//  1. cwrap 死 → ready 管道读端关闭 → 代理收到 HUP → 代理自停并 unlink socket；
+//  2. cwrap 死 → 包装 bwrap 收到 PDEATHSIG（--die-with-parent）→ bwrap 退出；
+//  3. 代理卡死不响应 HUP → Stop 超时对进程组整组 SIGKILL（Setpgid 见 Start）。
+func dbusProxyWrapperArgs(socketDir string, infoFD int) []string {
 	var a []string
-	if syncFD > 0 {
-		a = append(a, "--sync-fd", strconv.Itoa(syncFD))
-	}
+	a = append(a, "--die-with-parent")
 	if entries, err := os.ReadDir("/"); err == nil {
 		for _, e := range entries {
 			name := e.Name()
@@ -333,11 +328,17 @@ func (p *Proxy) Stop() {
 		go func() { p.cmd.Wait(); close(done) }()
 		select {
 		case <-done: // 代理收到 HUP，已自停并清理 socket
-		case <-time.After(2 * time.Second): // 兜底：SIGKILL（socket 残留由下次启动清扫兜底）
+		case <-time.After(2 * time.Second):
+			// 兜底：整组 SIGKILL。仅 Kill 包装 bwrap 会让代理（其子进程）
+			// 变孤儿继续运行，socket 残留且进程仍活，pruneLocked 扫不到。
 			if p.cmd.Process != nil {
-				p.cmd.Process.Kill()
+				if pgid, gerr := syscall.Getpgid(p.cmd.Process.Pid); gerr == nil && pgid > 0 {
+					syscall.Kill(-pgid, syscall.SIGKILL)
+				} else {
+					p.cmd.Process.Kill() // 取不到 pgid 时退回单进程
+				}
 			}
-			p.cmd.Wait()
+			<-done // 收尸交给 goroutine 里的 Wait，避免双 Wait 竞态
 		}
 		return
 	}

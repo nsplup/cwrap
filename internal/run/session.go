@@ -1,9 +1,8 @@
 // Package run 在 cwrap 主进程内直接执行沙箱会话（无守护进程）。
 //
-// 生命周期：cwrap 持有一条 sync 管道的写端，读端经 bwrap --sync-fd
-// 传给主沙箱与（portal 场景下）包装 D-Bus 代理的 bwrap。无论 cwrap
-// 以何种方式退出（正常结束、panic、被 SIGKILL），写端都随进程关闭，
-// bwrap 检测到 HUP 后立即终止对应沙箱——沙箱生命周期与主进程严格同步。
+// 生命周期：bwrap 以 --die-with-parent（内核 PR_SET_PDEATHSIG）与 cwrap
+// 主进程绑定——无论 cwrap 以何种方式退出（正常结束、panic、被 SIGKILL），
+// 内核都会依序 SIGKILL bwrap monitor 与沙箱进程，沙箱不残留。
 // 未包装的 xdg-dbus-proxy 由其 --fd 就绪管道承担同一语义（读端由
 // cwrap 持有到运行结束，对端关闭即代理自停并 unlink socket）。
 //
@@ -55,15 +54,6 @@ func session(spec *perm.Permissions, argv []string, inst *Instance) int {
 		fmt.Fprintf(os.Stderr, "错误: "+format+"\n", a...)
 		return 1
 	}
-
-	// 生命周期 sync 管道：写端由本进程持有到运行结束（defer 关闭），
-	// 读端经 --sync-fd 交给主沙箱 bwrap 与代理包装 bwrap。
-	syncR, syncW, err := os.Pipe()
-	if err != nil {
-		return fail("创建 sync 管道: %v", err)
-	}
-	defer syncR.Close()
-	defer syncW.Close()
 
 	// 以下变量在 cleanup 闭包定义之前声明：闭包按引用捕获，
 	// 赋值可以晚于闭包定义（Go 词法作用域规则）。
@@ -131,14 +121,14 @@ func session(spec *perm.Permissions, argv []string, inst *Instance) int {
 	// D-Bus 代理（默认零规则，仅显式授权）。
 	// portal 场景下代理由 bwrap 包装运行（对齐 flatpak add_bwrap_wrapper），
 	// 使其命名空间根里可见 /.flatpak-info——portal 通过 /proc/<代理pid>/root
-	// 读取它识别 caller 身份。包装 bwrap 同样接收 --sync-fd。
+	// 读取它识别 caller 身份。
 	session, system := dbusproxy.NeedBuses(spec)
 	if session {
 		addr, aerr := dbusproxy.SessionAddress()
 		if aerr == nil {
 			sessionProxy, aerr = dbusproxy.Start(prog.BwrapCmd(), prog.DBusProxyCmd(), addr,
 				filepath.Join(dir, "session"), append(append([]string{}, spec.DBus...), spec.RawDBus...),
-				[]byte(flatpakInfoContent), logw, syncR)
+				[]byte(flatpakInfoContent), logw)
 		}
 		if aerr != nil {
 			return fail("%v", aerr)
@@ -151,7 +141,7 @@ func session(spec *perm.Permissions, argv []string, inst *Instance) int {
 		}
 		sp, aerr := dbusproxy.Start(prog.BwrapCmd(), prog.DBusProxyCmd(), addr,
 			filepath.Join(dir, "system"), append(append([]string{}, spec.DBus...), spec.RawDBus...),
-			[]byte(flatpakInfoContent), logw, syncR)
+			[]byte(flatpakInfoContent), logw)
 		if aerr != nil {
 			return fail("%v", aerr)
 		}
@@ -238,10 +228,6 @@ func session(spec *perm.Permissions, argv []string, inst *Instance) int {
 		}
 	}
 
-	// 生命周期 sync-fd：读端交给主沙箱 bwrap（写端 syncW 由本进程持有）。
-	extraFiles = append(extraFiles, syncR)
-	syncFD := fdNo()
-
 	uid := syscall.Getuid()
 	// --allow portal：解析宿主 flatpak-xdg-utils 的 xdg-open 路径
 	// （config.toml 的 xdg_open_path 优先，否则按发行版候选探测）。
@@ -265,7 +251,6 @@ func session(spec *perm.Permissions, argv []string, inst *Instance) int {
 		InfoFD:          infoFD,
 		NetResolvFD:     netResolvFD,
 		StatusFD:        statusFD,
-		SyncFD:          syncFD,
 		CmdPath:         argv[0],
 		CmdArgs:         argv[1:],
 	})
@@ -351,8 +336,8 @@ func session(spec *perm.Permissions, argv []string, inst *Instance) int {
 
 	// 信号转发：cwrap 收到的终止类信号转发给沙箱进程组；
 	// SIGTERM/SIGHUP 宽限 3 秒后升级为 SIGKILL，避免卡死。
-	// cwrap 自身被 SIGKILL 时无需转发——sync-fd 写端随进程关闭，
-	// bwrap 立即回收沙箱。
+	// cwrap 自身被 SIGKILL 时无需转发——bwrap 已带 --die-with-parent，
+	// 内核 PDEATHSIG 会依序回收 monitor 与沙箱进程。
 	sigCh := make(chan os.Signal, 8)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
